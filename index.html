@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Compliance Checklist Automation</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        .container {
+            max-width: 1000px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            padding: 40px;
+        }
+        h1 {
+            color: #333;
+            text-align: center;
+            margin-bottom: 10px;
+            font-size: 2.5em;
+        }
+        .subtitle {
+            text-align: center;
+            color: #666;
+            margin-bottom: 40px;
+            font-size: 1.1em;
+        }
+        .step {
+            margin-bottom: 30px;
+            padding: 25px;
+            background: #f8f9fa;
+            border-radius: 12px;
+            border-left: 5px solid #667eea;
+        }
+        .step h2 {
+            color: #667eea;
+            margin-bottom: 15px;
+            font-size: 1.5em;
+        }
+        .upload-area {
+            border: 3px dashed #ccc;
+            border-radius: 10px;
+            padding: 40px;
+            text-align: center;
+            background: white;
+            transition: all 0.3s ease;
+            cursor: pointer;
+        }
+        .upload-area:hover {
+            border-color: #667eea;
+            background: #f0f4ff;
+        }
+        input[type="file"] {
+            display: none;
+        }
+        .file-label {
+            display: inline-block;
+            padding: 12px 30px;
+            background: #667eea;
+            color: white;
+            border-radius: 8px;
+            cursor: pointer;
+            font-weight: 600;
+            transition: all 0.3s ease;
+        }
+        .file-label:hover {
+            background: #5568d3;
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
+        }
+        .file-list {
+            margin-top: 20px;
+            padding: 15px;
+            background: white;
+            border-radius: 8px;
+            max-height: 200px;
+            overflow-y: auto;
+        }
+        .file-item {
+            padding: 10px;
+            margin: 5px 0;
+            background: #f0f4ff;
+            border-radius: 6px;
+            display: flex;
+            justify-content: space-between;
+        }
+        .btn {
+            padding: 15px 40px;
+            background: #667eea;
+            color: white;
+            border: none;
+            border-radius: 8px;
+            font-size: 1.1em;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            margin: 10px 5px;
+        }
+        .btn:hover {
+            background: #5568d3;
+            transform: translateY(-2px);
+        }
+        .btn-success {
+            background: #28a745;
+        }
+        .status-message {
+            margin-top: 15px;
+            padding: 15px;
+            border-radius: 8px;
+            display: none;
+        }
+        .status-message.success {
+            background: #d4edda;
+            color: #155724;
+        }
+        .status-message.error {
+            background: #f8d7da;
+            color: #721c24;
+        }
+        .spinner {
+            border: 4px solid #f3f3f3;
+            border-top: 4px solid #667eea;
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            animation: spin 1s linear infinite;
+            margin: 20px auto;
+            display: none;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>📋 Compliance Checklist Automation</h1>
+        <p class="subtitle">Automatically fill compliance checklists from candidate documents</p>
+
+        <div class="step">
+            <h2>Step 1: Upload Candidate Documents</h2>
+            <p style="margin-bottom: 15px; color: #666;">Upload PDF, images, or Word documents</p>
+            <div class="upload-area" id="candidateUploadArea">
+                <p style="margin: 15px 0; color: #666;">Drag and drop files or</p>
+                <label for="candidateFiles" class="file-label">Choose Files</label>
+                <input type="file" id="candidateFiles" multiple accept=".pdf,.png,.jpg,.jpeg,.docx">
+            </div>
+            <div class="file-list" id="candidateFileList" style="display: none;"></div>
+        </div>
+
+        <div class="step">
+            <h2>Step 2: Upload Checklist Templates (Optional)</h2>
+            <p style="margin-bottom: 15px; color: #666;">Upload .docx templates with placeholders</p>
+            <div class="upload-area" id="templateUploadArea">
+                <p style="margin: 15px 0; color: #666;">Upload checklist templates</p>
+                <label for="templateFiles" class="file-label">Choose Templates</label>
+                <input type="file" id="templateFiles" multiple accept=".docx">
+            </div>
+            <div class="file-list" id="templateFileList" style="display: none;"></div>
+        </div>
+
+        <div style="text-align: center; margin-top: 30px;">
+            <button class="btn" onclick="processDocuments()">🔍 Process Documents</button>
+        </div>
+
+        <div class="spinner" id="spinner"></div>
+        <div class="status-message" id="statusMessage"></div>
+    </div>
+
+    <script>
+        let candidateFiles = [];
+        let templateFiles = [];
+
+        document.getElementById('candidateFiles').addEventListener('change', function() {
+            candidateFiles = Array.from(this.files);
+            displayFiles('candidateFileList', candidateFiles);
+        });
+
+        document.getElementById('templateFiles').addEventListener('change', function() {
+            templateFiles = Array.from(this.files);
+            displayFiles('templateFileList', templateFiles);
+        });
+
+        function displayFiles(listId, files) {
+            const list = document.getElementById(listId);
+            if (files.length > 0) {
+                list.style.display = 'block';
+                list.innerHTML = files.map(f => `
+                    <div class="file-item">
+                        <span>${f.name}</span>
+                        <span>${(f.size / 1024).toFixed(1)} KB</span>
+                    </div>
+                `).join('');
+            }
+        }
+
+        function showStatus(msg, type) {
+            const el = document.getElementById('statusMessage');
+            el.textContent = msg;
+            el.className = `status-message ${type}`;
+            el.style.display = 'block';
+        }
+
+        async function processDocuments() {
+            if (candidateFiles.length === 0) {
+                showStatus('Please upload candidate documents!', 'error');
+                return;
+            }
+
+            document.getElementById('spinner').style.display = 'block';
+            showStatus('Processing...', 'info');
+
+            const formData = new FormData();
+            candidateFiles.forEach(f => formData.append('candidate_files', f));
+            templateFiles.forEach(f => formData.append('template_files', f));
+
+            try {
+                const response = await fetch('/upload', {
+                    method: 'POST',
+                    body: formData
+                });
+                const result = await response.json();
+                
+                if (result.success) {
+                    showStatus('Documents processed successfully!', 'success');
+                } else {
+                    showStatus('Error: ' + result.error, 'error');
+                }
+            } catch (error) {
+                showStatus('Upload failed: ' + error.message, 'error');
+            }
+            
+            document.getElementById('spinner').style.display = 'none';
+        }
+    </script>
+</body>
+</html>

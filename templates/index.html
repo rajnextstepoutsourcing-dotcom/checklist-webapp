@@ -1,0 +1,451 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Compliance Checklist — NextStep</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Sora:wght@600;700;800&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+  <style>
+    :root{
+      --bg:#070a10;--bg2:#0b1220;--card:#0b1426;--border:rgba(255,255,255,.10);
+      --border2:rgba(255,255,255,.06);--text:#f2f6ff;--muted:#a9b6cc;--muted2:#6b7fa0;
+      --primary:#2563eb;--primary2:#3b82f6;--glow:rgba(37,99,235,.35);
+      --ok:#22c55e;--warn:#f59e0b;--danger:#ef4444;
+      --radius:14px;--radius-sm:10px;
+      --font-head:'Sora',system-ui,sans-serif;
+      --font-body:'Inter',system-ui,sans-serif;
+    }
+    *,*::before,*::after{box-sizing:border-box;margin:0;padding:0;}
+    body{font-family:var(--font-body);background:var(--bg);color:var(--text);min-height:100vh;line-height:1.6;}
+    body::before{content:'';position:fixed;inset:0;background-image:url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noise'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noise)' opacity='0.03'/%3E%3C/svg%3E");pointer-events:none;z-index:0;opacity:.4;}
+    .container{max-width:1300px;margin:0 auto;padding:18px 16px;position:relative;}
+
+    /* ── Top bar ── */
+    .topBar{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:10px;}
+    .topBar-brand{display:flex;align-items:center;gap:10px;}
+    .brand-icon{width:32px;height:32px;background:linear-gradient(135deg,var(--primary),var(--primary2));border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:14px;box-shadow:0 0 14px var(--glow);}
+    .brand-name{font-family:var(--font-head);font-size:17px;font-weight:700;color:var(--text);}
+    .brand-name span{color:var(--primary2);}
+    .brand-sep{color:var(--border);margin:0 4px;}
+    .brand-tool{font-size:14px;color:var(--muted);font-weight:500;}
+    .btn-back{font-size:13px;color:var(--muted);text-decoration:none;padding:6px 12px;border:1px solid var(--border);border-radius:var(--radius-sm);transition:color .15s,border-color .15s;}
+    .btn-back:hover{color:var(--text);border-color:rgba(255,255,255,.22);}
+
+    /* ── Auth warning ── */
+    .auth-warning{display:flex;align-items:center;gap:10px;background:rgba(239,68,68,.10);border:1px solid rgba(239,68,68,.25);border-radius:var(--radius-sm);padding:12px 16px;font-size:13px;color:#fca5a5;margin-bottom:14px;}
+    .auth-warning a{color:var(--primary2);}
+    .token-bar{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--muted);background:rgba(37,99,235,.08);border:1px solid rgba(37,99,235,.18);border-radius:var(--radius-sm);padding:8px 14px;margin-bottom:14px;}
+    .token-count{font-weight:700;color:var(--primary2);font-size:15px;}
+    .hidden{display:none!important;}
+
+    /* ── Cards ── */
+    .card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:16px;margin:16px 0;box-shadow:0 14px 40px rgba(0,0,0,.40);}
+    h1{font-family:var(--font-head);margin:0 0 6px;font-size:26px;font-weight:800;letter-spacing:-.03em;}
+    h2{font-family:var(--font-head);margin:0 0 10px;font-size:17px;font-weight:700;letter-spacing:-.02em;}
+    h3{margin:0 0 10px;font-size:15px;font-weight:600;}
+    .muted{color:var(--muted);}
+    .small{font-size:12px;}
+    .divider{height:1px;background:rgba(255,255,255,.10);margin:14px 0;}
+
+    /* ── Folder grid ── */
+    .folder-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:10px;margin-bottom:14px;}
+    .folder-card{background:rgba(0,0,0,.18);border:2px dashed rgba(255,255,255,.14);border-radius:var(--radius-sm);padding:14px;cursor:pointer;transition:border-color .2s,background .2s;position:relative;}
+    .folder-card:hover{border-color:rgba(37,99,235,.45);background:rgba(37,99,235,.06);}
+    .folder-card.has-files{border-style:solid;border-color:rgba(34,197,94,.35);background:rgba(34,197,94,.06);}
+    .folder-name{font-weight:600;font-size:13px;margin-bottom:4px;}
+    .folder-count{font-size:12px;color:var(--muted);}
+    .folder-input{position:absolute;inset:0;opacity:0;cursor:pointer;width:100%;height:100%;}
+
+    /* ── Fields grid ── */
+    .fields-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:10px;}
+    .field-group{display:flex;flex-direction:column;gap:5px;}
+    .field-group label{font-size:12px;font-weight:500;color:var(--muted);}
+    .field-group .conf-dot{display:inline-block;width:7px;height:7px;border-radius:999px;margin-right:5px;background:rgba(255,255,255,.22);}
+    .field-group .conf-dot.high{background:var(--ok);}
+    .field-group .conf-dot.med{background:var(--warn);}
+    .field-group .conf-dot.low{background:var(--danger);}
+    .field-group input{background:rgba(0,0,0,.25);border:1px solid rgba(255,255,255,.12);border-radius:var(--radius-sm);padding:9px 12px;color:var(--text);font-size:13px;font-family:var(--font-body);outline:none;transition:border-color .15s;}
+    .field-group input:focus{border-color:var(--primary2);box-shadow:0 0 0 3px rgba(37,99,235,.20);}
+    .field-group input::placeholder{color:var(--muted2);}
+
+    /* ── Templates grid ── */
+    .template-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:8px;margin-bottom:14px;}
+    .template-card{display:flex;align-items:center;gap:10px;padding:10px 14px;border:1px solid var(--border);border-radius:var(--radius-sm);cursor:pointer;transition:border-color .15s,background .15s;font-size:13px;color:var(--muted);}
+    .template-card:has(input:checked){border-color:rgba(37,99,235,.45);background:rgba(37,99,235,.10);color:var(--text);}
+    .template-card input{accent-color:var(--primary2);width:14px;height:14px;flex-shrink:0;}
+
+    /* ── Buttons ── */
+    button{font-family:var(--font-body);background:rgba(0,0,0,.18);color:var(--text);border:1px solid rgba(255,255,255,.16);border-radius:var(--radius-sm);padding:10px 14px;cursor:pointer;transition:transform .12s,filter .12s,border-color .12s;font-size:14px;}
+    button:hover{border-color:rgba(255,255,255,.30);}
+    button:active{transform:translateY(1px);}
+    button.primary{background:var(--primary);border-color:var(--primary);color:#fff;}
+    button.primary:hover{filter:brightness(1.1);transform:translateY(-1px);box-shadow:0 8px 24px var(--glow);}
+    button.primary:disabled{opacity:.6;cursor:not-allowed;transform:none;}
+    button.ghost{background:transparent;border:1px solid rgba(255,255,255,.18);}
+    button.ghost:hover{border-color:rgba(255,255,255,.35);}
+    .row{display:flex;align-items:center;gap:12px;margin-top:12px;flex-wrap:wrap;}
+
+    /* ── Progress ── */
+    .progress-wrap{background:rgba(0,0,0,.14);border:1px solid var(--border);border-radius:var(--radius-sm);padding:14px 16px;margin-top:14px;}
+    .progress-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;flex-wrap:wrap;gap:8px;}
+    .progress-count{font-size:13px;color:var(--muted);font-weight:600;}
+    .progress-bar-outer{height:6px;background:rgba(255,255,255,.08);border-radius:999px;overflow:hidden;}
+    .progress-bar-inner{height:100%;background:linear-gradient(90deg,var(--primary),var(--primary2));border-radius:999px;transition:width .4s ease;}
+
+    /* ── Badges ── */
+    .badge{display:inline-flex;align-items:center;gap:5px;padding:4px 10px;border-radius:999px;font-size:12px;font-weight:600;border:1px solid var(--border);background:rgba(0,0,0,.12);}
+    .badge.running{border-color:rgba(96,165,250,.55);color:rgba(191,219,254,1);background:rgba(37,99,235,.16);}
+    .badge.done{border-color:rgba(34,197,94,.35);color:var(--ok);background:rgba(34,197,94,.10);}
+    .badge.failed-all{border-color:rgba(239,68,68,.45);color:rgba(254,202,202,1);background:rgba(239,68,68,.10);}
+
+    /* ── Downloads ── */
+    .download-list{display:flex;flex-direction:column;gap:8px;margin-top:12px;}
+    .download-item{display:flex;align-items:center;justify-content:space-between;background:rgba(0,0,0,.14);border:1px solid var(--border);border-radius:var(--radius-sm);padding:10px 14px;}
+    .download-item .fname{font-size:13px;font-weight:500;}
+    .download-item a{font-size:12px;color:var(--primary2);text-decoration:none;padding:5px 10px;border:1px solid rgba(37,99,235,.30);border-radius:8px;}
+    .download-item a:hover{background:rgba(37,99,235,.12);}
+    .zip-btn{margin-top:8px;width:100%;}
+
+    /* ── Flash ── */
+    .flash{padding:11px 16px;border-radius:var(--radius-sm);font-size:13px;margin-bottom:12px;border:1px solid transparent;}
+    .flash-error{background:rgba(239,68,68,.10);border-color:rgba(239,68,68,.25);color:#fca5a5;}
+    .flash-success{background:rgba(34,197,94,.10);border-color:rgba(34,197,94,.25);color:#86efac;}
+    .flash-warn{background:rgba(245,158,11,.10);border-color:rgba(245,158,11,.25);color:#fde68a;}
+
+    /* ── Token info ── */
+    .token-info{font-size:12px;color:var(--muted2);margin-top:6px;}
+
+    @media(max-width:700px){.fields-grid{grid-template-columns:1fr 1fr;}.folder-grid{grid-template-columns:repeat(3,1fr);}}
+    @media(max-width:500px){.fields-grid{grid-template-columns:1fr;}.folder-grid{grid-template-columns:repeat(2,1fr);}}
+  </style>
+</head>
+<body>
+<div class="container">
+
+  <div class="topBar">
+    <div class="topBar-brand">
+      <div class="brand-icon">⚡</div>
+      <span class="brand-name">Next<span>Step</span></span>
+      <span class="brand-sep">|</span>
+      <span class="brand-tool">Compliance Checklist</span>
+    </div>
+    <a href="https://nextstep.co.uk/dashboard" class="btn-back">← Dashboard</a>
+  </div>
+
+  {% if auth_required %}
+  <div class="auth-warning">
+    <span>⚠</span>
+    <span>You must be logged in to use this tool. <a href="https://nextstep.co.uk/login">Log in here</a></span>
+  </div>
+  {% endif %}
+
+  <div id="tokenBar" class="token-bar hidden">
+    <span class="token-label">🪙 Tokens remaining:</span>
+    <span id="tokenCount" class="token-count">—</span>
+  </div>
+
+  <p class="muted" style="margin-bottom:8px;">Upload candidate documents → AI extracts fields → Edit if needed → Select templates → Generate filled checklists</p>
+
+  <div id="flashWrap"></div>
+
+  <!-- Step 1 — Upload -->
+  <section class="card">
+    <h2>Step 1 — Upload documents</h2>
+    <p class="muted small" style="margin-bottom:12px;">Upload files into each relevant folder. AI will extract candidate data automatically.</p>
+    <div class="folder-grid" id="folderGrid">
+      {% for folder in folders %}
+      <div class="folder-card" id="fc_{{ folder.replace(' ','_') }}" onclick="document.getElementById('fi_{{ folder.replace(' ','_') }}').click()">
+        <input type="file" id="fi_{{ folder.replace(' ','_') }}" class="folder-input" multiple
+               accept=".pdf,.png,.jpg,.jpeg,.docx,.txt"
+               data-folder="{{ folder }}" onchange="onFolderFiles(this)"/>
+        <div class="folder-name">{{ folder }}</div>
+        <div class="folder-count" id="fcount_{{ folder.replace(' ','_') }}">No files</div>
+      </div>
+      {% endfor %}
+    </div>
+    <div class="row">
+      <button id="btnUpload" class="primary" onclick="doUpload()">Upload All &amp; Extract</button>
+      <span id="uploadStatus" class="muted"></span>
+    </div>
+    <div class="token-info">ℹ Uploading + extracting uses <strong>1 token</strong></div>
+  </section>
+
+  <!-- Step 2 — Edit extracted fields -->
+  <section class="card" id="extractSection" style="display:none;">
+    <h2>Step 2 — Review &amp; edit extracted fields</h2>
+    <p class="muted small" style="margin-bottom:12px;">AI-extracted values are shown below. Edit any field before generating.</p>
+    <div class="fields-grid" id="fieldsGrid"></div>
+  </section>
+
+  <!-- Step 3 — Select templates & generate -->
+  <section class="card" id="generateSection" style="display:none;">
+    <h2>Step 3 — Select templates &amp; generate</h2>
+    <p class="muted small" style="margin-bottom:10px;">Select which checklists to fill. Each template costs <strong>1 token</strong>.</p>
+    <div class="template-grid" id="templateGrid"></div>
+
+    <div id="progressWrap" class="progress-wrap hidden">
+      <div class="progress-header">
+        <span id="progressBadge" class="badge running">⚙️ Generating</span>
+        <span id="progressCount" class="progress-count"></span>
+      </div>
+      <div class="progress-bar-outer"><div id="progressBar" class="progress-bar-inner" style="width:0%"></div></div>
+    </div>
+
+    <div class="row">
+      <button id="btnGenerate" class="primary" onclick="doGenerate()">Generate Selected Checklists</button>
+      <span id="generateStatus" class="muted"></span>
+    </div>
+    <div class="token-info">ℹ Each selected template costs <strong>1 token</strong> per generate click</div>
+  </section>
+
+  <!-- Step 4 — Downloads -->
+  <section class="card" id="downloadSection" style="display:none;">
+    <h2>Step 4 — Download</h2>
+    <div class="download-list" id="downloadList"></div>
+  </section>
+
+</div>
+
+<script>
+"use strict";
+// ── State ─────────────────────────────────────────────────────────────────────
+const folderFiles = {};
+let sessionId = null;
+let extractedData = {};
+let availableTemplates = [];
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function flash(msg, type) {
+  const w = document.getElementById('flashWrap');
+  if (!w) return;
+  const d = document.createElement('div');
+  d.className = `flash flash-${type}`;
+  d.textContent = msg;
+  w.appendChild(d);
+  setTimeout(() => d.remove(), 6000);
+}
+
+function setText(id, msg) { const el=document.getElementById(id); if(el) el.textContent=msg||''; }
+function show(id) { const el=document.getElementById(id); if(el) el.style.display=''; }
+function hide(id) { const el=document.getElementById(id); if(el) el.style.display='none'; }
+
+// ── Folder file tracking ──────────────────────────────────────────────────────
+function onFolderFiles(input) {
+  const folder = input.dataset.folder;
+  const files  = Array.from(input.files);
+  folderFiles[folder] = files;
+  const key = folder.replace(/ /g,'_');
+  const card = document.getElementById(`fc_${key}`);
+  const cnt  = document.getElementById(`fcount_${key}`);
+  if (cnt) cnt.textContent = files.length > 0 ? `${files.length} file(s)` : 'No files';
+  if (card) card.classList.toggle('has-files', files.length > 0);
+}
+
+// ── Upload + Extract ──────────────────────────────────────────────────────────
+async function doUpload() {
+  const btn = document.getElementById('btnUpload');
+  const totalFiles = Object.values(folderFiles).reduce((s,f) => s+f.length, 0);
+  if (totalFiles === 0) { flash('Please upload at least one file.', 'error'); return; }
+
+  btn.disabled = true; btn.textContent = 'Uploading…';
+  setText('uploadStatus', 'Uploading files…');
+
+  // Build FormData
+  const fd = new FormData();
+  for (const [folder, files] of Object.entries(folderFiles)) {
+    const fieldName = `files_${folder.replace(/ /g,'_')}`;
+    files.forEach(f => fd.append(fieldName, f));
+  }
+
+  try {
+    // Upload
+    const upRes  = await fetch('/upload', { method: 'POST', body: fd });
+    const upData = await upRes.json();
+    if (!upRes.ok || !upData.success) throw new Error(upData.error || 'Upload failed');
+    sessionId = upData.session_id;
+    setText('uploadStatus', 'Extracting data with AI…');
+    btn.textContent = 'Extracting…';
+
+    // Extract (charges 1 token)
+    const exRes  = await fetch('/extract', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: sessionId })
+    });
+    const exData = await exRes.json();
+    if (!exRes.ok) {
+      const msg = exData.error || 'Extraction failed';
+      if (exRes.status === 402) { flash(msg, 'error'); return; }
+      throw new Error(msg);
+    }
+
+    extractedData = exData.extracted_data || {};
+    renderFields(extractedData);
+    show('extractSection');
+    show('generateSection');
+    await loadTemplates();
+    setText('uploadStatus', 'Done — review fields below.');
+    flash('Extraction complete — 1 token used', 'success');
+  } catch(e) {
+    flash(e.message || 'Upload/Extract failed', 'error');
+    setText('uploadStatus', 'Failed — see message above');
+  } finally {
+    btn.disabled = false; btn.textContent = 'Upload All & Extract';
+  }
+}
+
+// ── Render extracted fields ───────────────────────────────────────────────────
+function renderFields(data) {
+  const grid = document.getElementById('fieldsGrid');
+  if (!grid) return;
+  grid.innerHTML = '';
+  const fields = {{ fields | tojson }};
+  fields.forEach(field => {
+    const fv   = data[field] || {};
+    const val  = fv.value  || '';
+    const conf = fv.confidence || 0;
+    const dotClass = conf >= 0.8 ? 'high' : conf >= 0.5 ? 'med' : (val ? 'low' : '');
+
+    const div = document.createElement('div');
+    div.className = 'field-group';
+    div.innerHTML = `
+      <label>
+        <span class="conf-dot ${dotClass}"></span>${field}
+        ${conf > 0 ? `<span class="small muted" style="float:right">${Math.round(conf*100)}%</span>` : ''}
+      </label>
+      <input type="text" data-field="${field}" value="${(val||'').replace(/"/g,'&quot;')}" placeholder="${field}"/>
+    `;
+    grid.appendChild(div);
+  });
+}
+
+function collectFieldValues() {
+  const vals = {};
+  document.querySelectorAll('#fieldsGrid input[data-field]').forEach(inp => {
+    vals[inp.dataset.field] = inp.value.trim();
+  });
+  return vals;
+}
+
+// ── Load templates ────────────────────────────────────────────────────────────
+async function loadTemplates() {
+  try {
+    const res  = await fetch('/templates');
+    const data = await res.json();
+    availableTemplates = data.templates || [];
+    renderTemplates(availableTemplates);
+  } catch(e) {
+    console.warn('[Templates]', e);
+  }
+}
+
+function renderTemplates(templates) {
+  const grid = document.getElementById('templateGrid');
+  if (!grid) return;
+  grid.innerHTML = '';
+  templates.forEach(t => {
+    const label = document.createElement('label');
+    label.className = 'template-card';
+    label.innerHTML = `<input type="checkbox" value="${t}" checked/> 📄 ${t}`;
+    grid.appendChild(label);
+  });
+}
+
+function getSelectedTemplates() {
+  return Array.from(document.querySelectorAll('#templateGrid input:checked')).map(i => i.value);
+}
+
+// ── Generate ──────────────────────────────────────────────────────────────────
+async function doGenerate() {
+  if (!sessionId) { flash('Please upload and extract first.', 'error'); return; }
+  const selected = getSelectedTemplates();
+  if (!selected.length) { flash('Please select at least one template.', 'error'); return; }
+
+  const btn = document.getElementById('btnGenerate');
+  btn.disabled = true; btn.textContent = 'Generating…';
+  setText('generateStatus', '');
+
+  // Show progress
+  const wrap = document.getElementById('progressWrap');
+  const bar  = document.getElementById('progressBar');
+  const badge = document.getElementById('progressBadge');
+  const count = document.getElementById('progressCount');
+  if (wrap) wrap.classList.remove('hidden');
+  if (badge) { badge.className = 'badge running'; badge.textContent = '⚙️ Generating'; }
+  if (count) count.textContent = `0 of ${selected.length} complete`;
+  if (bar)   bar.style.width = '10%';
+
+  // Animate bar
+  let pct = 10;
+  const anim = setInterval(() => {
+    pct = Math.min(pct + 5, 80);
+    if (bar) bar.style.width = pct + '%';
+  }, 400);
+
+  try {
+    const fieldValues = collectFieldValues();
+    const res  = await fetch('/process', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: sessionId, field_values: fieldValues, selected_templates: selected })
+    });
+    const data = await res.json();
+    clearInterval(anim);
+
+    if (!res.ok || !data.success) {
+      if (res.status === 402) { flash(data.error || 'No tokens remaining.', 'error'); return; }
+      throw new Error(data.error || 'Generation failed');
+    }
+
+    if (bar)   bar.style.width = '100%';
+    if (badge) { badge.className = 'badge done'; badge.textContent = '✓ Complete'; }
+    if (count) count.textContent = `${data.files_generated} of ${selected.length} complete`;
+
+    const charged = data.tokens_charged || data.files_generated || 0;
+    flash(`Generated ${data.files_generated} checklist(s) — ${charged} token(s) used`, 'success');
+    setText('generateStatus', `${data.files_generated} file(s) ready`);
+
+    renderDownloads(data);
+    show('downloadSection');
+
+    if (data.errors && data.errors.length) {
+      data.errors.forEach(e => flash(`Warning: ${e}`, 'warn'));
+    }
+
+  } catch(e) {
+    clearInterval(anim);
+    if (bar)   bar.style.width = '100%';
+    if (badge) { badge.className = 'badge failed-all'; badge.textContent = '✗ Failed'; }
+    flash(e.message || 'Generation failed', 'error');
+    setText('generateStatus', 'Failed — see message above');
+  } finally {
+    btn.disabled = false; btn.textContent = 'Generate Selected Checklists';
+  }
+}
+
+// ── Render downloads ──────────────────────────────────────────────────────────
+function renderDownloads(data) {
+  const list = document.getElementById('downloadList');
+  if (!list) return;
+  list.innerHTML = '';
+  (data.file_downloads || []).forEach(f => {
+    const div = document.createElement('div');
+    div.className = 'download-item';
+    div.innerHTML = `
+      <span class="fname">📄 ${f.filename}</span>
+      <a href="${f.url}" download="${f.filename}">⬇ Download</a>
+    `;
+    list.appendChild(div);
+  });
+  if (data.zip_available && data.zip_download_url) {
+    const zipBtn = document.createElement('button');
+    zipBtn.className = 'primary zip-btn';
+    zipBtn.textContent = '⬇ Download All (ZIP)';
+    zipBtn.onclick = () => { window.location.href = data.zip_download_url; };
+    list.appendChild(zipBtn);
+  }
+}
+</script>
+</body>
+</html>
