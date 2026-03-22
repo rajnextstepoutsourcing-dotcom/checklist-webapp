@@ -145,7 +145,7 @@
     <span id="tokenCount" class="token-count">—</span>
   </div>
 
-  <p class="muted" style="margin-bottom:8px;">Upload candidate documents → AI extracts fields → Edit if needed → Select templates → Generate filled checklists</p>
+  <p class="muted" style="margin-bottom:8px;">Upload candidate documents → Queue AI extraction → Edit if needed → Select templates → Generate filled checklists</p>
 
   <div id="flashWrap"></div>
 
@@ -165,10 +165,11 @@
       {% endfor %}
     </div>
     <div class="row">
-      <button id="btnUpload" class="primary" onclick="doUpload()">Upload All &amp; Extract</button>
+      <button id="btnUpload" class="primary" onclick="doUpload()">Upload Files</button>
       <span id="uploadStatus" class="muted"></span>
+      <button id="btnExtract" class="ghost" onclick="startExtraction()" disabled>Queue Extraction</button>
     </div>
-    <div class="token-info">ℹ Uploading + extracting uses <strong>1 token</strong></div>
+    <div class="token-info">ℹ Successful extraction uses <strong>1 token</strong>. Missing some fields is still valid if usable data is extracted.</div>
   </section>
 
   <!-- Step 2 — Edit extracted fields -->
@@ -181,7 +182,9 @@
   <!-- Step 3 — Select templates & generate -->
   <section class="card" id="generateSection" style="display:none;">
     <h2>Step 3 — Select templates &amp; generate</h2>
-    <p class="muted small" style="margin-bottom:10px;">Select which checklists to fill. Each template costs <strong>1 token</strong>.</p>
+    <p class="muted small" style="margin-bottom:10px;">Select which checklists to fill. Tokens are charged on first download only.</p>
+    <input id="templateSearch" type="text" placeholder="Search templates..." oninput="renderTemplates(availableTemplates)" style="width:100%;background:rgba(0,0,0,.25);border:1px solid rgba(255,255,255,.12);border-radius:var(--radius-sm);padding:10px 12px;color:var(--text);margin-bottom:10px;">
+    <div class="small muted" id="selectedCount" style="margin-bottom:10px;">Selected: 0 templates</div>
     <div class="template-grid" id="templateGrid"></div>
 
     <div id="progressWrap" class="progress-wrap hidden">
@@ -196,7 +199,7 @@
       <button id="btnGenerate" class="primary" onclick="doGenerate()">Generate Selected Checklists</button>
       <span id="generateStatus" class="muted"></span>
     </div>
-    <div class="token-info">ℹ Each selected template costs <strong>1 token</strong> per generate click</div>
+    <div class="token-info">ℹ First download of each generated checklist file costs <strong>1 token</strong>. Re-download in the same session is free.</div>
   </section>
 
   <!-- Step 4 — Downloads -->
@@ -209,13 +212,13 @@
 
 <script>
 "use strict";
-// ── State ─────────────────────────────────────────────────────────────────────
 const folderFiles = {};
 let sessionId = null;
+let jobId = null;
 let extractedData = {};
 let availableTemplates = [];
+let pollTimer = null;
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
 function flash(msg, type) {
   const w = document.getElementById('flashWrap');
   if (!w) return;
@@ -225,12 +228,10 @@ function flash(msg, type) {
   w.appendChild(d);
   setTimeout(() => d.remove(), 6000);
 }
-
 function setText(id, msg) { const el=document.getElementById(id); if(el) el.textContent=msg||''; }
 function show(id) { const el=document.getElementById(id); if(el) el.style.display=''; }
 function hide(id) { const el=document.getElementById(id); if(el) el.style.display='none'; }
 
-// ── Folder file tracking ──────────────────────────────────────────────────────
 function onFolderFiles(input) {
   const folder = input.dataset.folder;
   const files  = Array.from(input.files);
@@ -242,79 +243,121 @@ function onFolderFiles(input) {
   if (card) card.classList.toggle('has-files', files.length > 0);
 }
 
-// ── Upload + Extract ──────────────────────────────────────────────────────────
 async function doUpload() {
   const btn = document.getElementById('btnUpload');
   const totalFiles = Object.values(folderFiles).reduce((s,f) => s+f.length, 0);
   if (totalFiles === 0) { flash('Please upload at least one file.', 'error'); return; }
-
   btn.disabled = true; btn.textContent = 'Uploading…';
   setText('uploadStatus', 'Uploading files…');
-
-  // Build FormData
   const fd = new FormData();
   for (const [folder, files] of Object.entries(folderFiles)) {
     const fieldName = `files_${folder.replace(/ /g,'_')}`;
     files.forEach(f => fd.append(fieldName, f));
   }
-
   try {
-    // Upload
     const upRes  = await fetch('/upload', { method: 'POST', body: fd });
     const upData = await upRes.json();
-    if (!upRes.ok || !upData.success) throw new Error(upData.error || 'Upload failed');
+    if (!upRes.ok || !upData.success) throw new Error(upData.error_message || upData.error || 'Upload failed');
     sessionId = upData.session_id;
-    setText('uploadStatus', 'Extracting data with AI…');
-    btn.textContent = 'Extracting…';
-
-    // Extract (charges 1 token)
-    const exRes  = await fetch('/extract', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ session_id: sessionId })
-    });
-    const exData = await exRes.json();
-    if (!exRes.ok) {
-      const msg = exData.error || 'Extraction failed';
-      if (exRes.status === 402) { flash(msg, 'error'); return; }
-      throw new Error(msg);
-    }
-
-    extractedData = exData.extracted_data || {};
-    renderFields(extractedData);
-    show('extractSection');
-    show('generateSection');
-    await loadTemplates();
-    setText('uploadStatus', 'Done — review fields below.');
-    flash('Extraction complete — 1 token used', 'success');
+    jobId = upData.job_id;
+    setText('uploadStatus', `Uploaded ${upData.uploaded_file_count || 0} file(s).`);
+    document.getElementById('btnExtract').disabled = false;
+    flash('Files uploaded successfully. Queue extraction when ready.', 'success');
   } catch(e) {
-    flash(e.message || 'Upload/Extract failed', 'error');
-    setText('uploadStatus', 'Failed — see message above');
+    flash(e.message || 'Upload failed', 'error');
+    setText('uploadStatus', 'Upload failed');
   } finally {
-    btn.disabled = false; btn.textContent = 'Upload All & Extract';
+    btn.disabled = false; btn.textContent = 'Upload Files';
   }
 }
 
-// ── Render extracted fields ───────────────────────────────────────────────────
+async function startExtraction() {
+  if (!sessionId || !jobId) { flash('Please upload files first.', 'error'); return; }
+  const btn = document.getElementById('btnExtract');
+  btn.disabled = true; btn.textContent = 'Queued…';
+  try {
+    const res = await fetch('/extract', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ job_id: jobId, session_id: sessionId })
+    });
+    const data = await res.json();
+    if (!res.ok || !data.success) throw new Error(data.error_message || data.error || 'Failed to queue extraction');
+    setText('uploadStatus', 'Extraction queued…');
+    flash('Extraction queued successfully.', 'success');
+    startPolling();
+  } catch (e) {
+    btn.disabled = false; btn.textContent = 'Queue Extraction';
+    flash(e.message || 'Failed to queue extraction', 'error');
+  }
+}
+
+function startPolling() {
+  stopPolling();
+  pollTimer = setInterval(checkExtractionStatus, 2500);
+  checkExtractionStatus();
+}
+function stopPolling() {
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+}
+
+async function checkExtractionStatus() {
+  if (!jobId) return;
+  try {
+    const res = await fetch(`/extract/status/${jobId}`);
+    const data = await res.json();
+    if (data.status === 'extract_queued' || data.status === 'extract_running') {
+      setText('uploadStatus', data.current_step || data.status);
+      document.getElementById('btnExtract').textContent = data.status === 'extract_queued' ? 'Queued…' : 'Extracting…';
+      return;
+    }
+    stopPolling();
+    if (data.status === 'extract_completed') {
+      setText('uploadStatus', 'Extraction complete — review fields below.');
+      document.getElementById('btnExtract').textContent = 'Queue Extraction';
+      await loadExtractedData();
+      flash('Extraction complete — 1 token used.', 'success');
+      return;
+    }
+    document.getElementById('btnExtract').disabled = false;
+    document.getElementById('btnExtract').textContent = 'Queue Extraction';
+    setText('uploadStatus', data.error_message || 'Extraction failed');
+    flash(data.error_message || 'Extraction failed', 'error');
+  } catch (e) {
+    stopPolling();
+    document.getElementById('btnExtract').disabled = false;
+    document.getElementById('btnExtract').textContent = 'Queue Extraction';
+    flash(e.message || 'Status check failed', 'error');
+  }
+}
+
+async function loadExtractedData() {
+  const res = await fetch(`/extracted/${sessionId}`);
+  const data = await res.json();
+  if (!res.ok || !data.success) throw new Error(data.error_message || 'Could not load extracted data');
+  extractedData = data.data || {};
+  renderFields(extractedData);
+  show('extractSection');
+  show('generateSection');
+  await loadTemplates();
+}
+
 function renderFields(data) {
   const grid = document.getElementById('fieldsGrid');
   if (!grid) return;
   grid.innerHTML = '';
   const fields = {{ fields | tojson }};
   fields.forEach(field => {
-    const fv   = data[field] || {};
+    const raw  = data[field] || '';
+    const fv   = typeof raw === 'object' ? raw : { value: raw, confidence: 0 };
     const val  = fv.value  || '';
     const conf = fv.confidence || 0;
     const dotClass = conf >= 0.8 ? 'high' : conf >= 0.5 ? 'med' : (val ? 'low' : '');
-
     const div = document.createElement('div');
     div.className = 'field-group';
     div.innerHTML = `
-      <label>
-        <span class="conf-dot ${dotClass}"></span>${field}
-        ${conf > 0 ? `<span class="small muted" style="float:right">${Math.round(conf*100)}%</span>` : ''}
-      </label>
-      <input type="text" data-field="${field}" value="${(val||'').replace(/"/g,'&quot;')}" placeholder="${field}"/>
+      <label><span class="conf-dot ${dotClass}"></span>${field}${conf > 0 ? `<span class="small muted" style="float:right">${Math.round(conf*100)}%</span>` : ''}</label>
+      <input type="text" data-field="${field}" value="${String(val).replace(/"/g,'&quot;')}" placeholder="${field}"/>
     `;
     grid.appendChild(div);
   });
@@ -328,45 +371,43 @@ function collectFieldValues() {
   return vals;
 }
 
-// ── Load templates ────────────────────────────────────────────────────────────
 async function loadTemplates() {
-  try {
-    const res  = await fetch('/templates');
-    const data = await res.json();
-    availableTemplates = data.templates || [];
-    renderTemplates(availableTemplates);
-  } catch(e) {
-    console.warn('[Templates]', e);
-  }
+  const res  = await fetch('/templates');
+  const data = await res.json();
+  availableTemplates = data.templates || [];
+  renderTemplates(availableTemplates);
 }
 
 function renderTemplates(templates) {
   const grid = document.getElementById('templateGrid');
   if (!grid) return;
+  const q = (document.getElementById('templateSearch').value || '').toLowerCase().trim();
+  const selected = new Set(getSelectedTemplates());
   grid.innerHTML = '';
-  templates.forEach(t => {
+  templates.filter(t => !q || t.template_name.toLowerCase().includes(q)).forEach(t => {
     const label = document.createElement('label');
     label.className = 'template-card';
-    label.innerHTML = `<input type="checkbox" value="${t}" checked/> 📄 ${t}`;
+    label.innerHTML = `<input type="checkbox" value="${t.template_key}" ${selected.has(t.template_key) || selected.size===0 ? 'checked' : ''} onchange="updateSelectedCount()"/> 📄 ${t.template_name}`;
     grid.appendChild(label);
   });
+  updateSelectedCount();
 }
-
 function getSelectedTemplates() {
   return Array.from(document.querySelectorAll('#templateGrid input:checked')).map(i => i.value);
 }
+function updateSelectedCount() {
+  const count = getSelectedTemplates().length;
+  const el = document.getElementById('selectedCount');
+  if (el) el.textContent = `Selected: ${count} template${count === 1 ? '' : 's'}`;
+}
 
-// ── Generate ──────────────────────────────────────────────────────────────────
 async function doGenerate() {
-  if (!sessionId) { flash('Please upload and extract first.', 'error'); return; }
+  if (!sessionId || !jobId) { flash('Please upload and extract first.', 'error'); return; }
   const selected = getSelectedTemplates();
   if (!selected.length) { flash('Please select at least one template.', 'error'); return; }
-
   const btn = document.getElementById('btnGenerate');
   btn.disabled = true; btn.textContent = 'Generating…';
-  setText('generateStatus', '');
-
-  // Show progress
+  setText('generateStatus', 'Saving review and generating…');
   const wrap = document.getElementById('progressWrap');
   const bar  = document.getElementById('progressBar');
   const badge = document.getElementById('progressBadge');
@@ -374,75 +415,57 @@ async function doGenerate() {
   if (wrap) wrap.classList.remove('hidden');
   if (badge) { badge.className = 'badge running'; badge.textContent = '⚙️ Generating'; }
   if (count) count.textContent = `0 of ${selected.length} complete`;
-  if (bar)   bar.style.width = '10%';
-
-  // Animate bar
-  let pct = 10;
-  const anim = setInterval(() => {
-    pct = Math.min(pct + 5, 80);
-    if (bar) bar.style.width = pct + '%';
-  }, 400);
-
+  if (bar) bar.style.width = '20%';
   try {
     const fieldValues = collectFieldValues();
-    const res  = await fetch('/process', {
+    await fetch(`/review/${sessionId}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ session_id: sessionId, field_values: fieldValues, selected_templates: selected })
+      body: JSON.stringify({ data: fieldValues })
+    });
+    const res  = await fetch('/generate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ job_id: jobId, session_id: sessionId, field_values: fieldValues, selected_templates: selected })
     });
     const data = await res.json();
-    clearInterval(anim);
-
-    if (!res.ok || !data.success) {
-      if (res.status === 402) { flash(data.error || 'No tokens remaining.', 'error'); return; }
-      throw new Error(data.error || 'Generation failed');
-    }
-
-    if (bar)   bar.style.width = '100%';
+    if (!res.ok || !data.success) throw new Error(data.error_message || 'Generation failed');
+    if (bar) bar.style.width = '100%';
     if (badge) { badge.className = 'badge done'; badge.textContent = '✓ Complete'; }
-    if (count) count.textContent = `${data.files_generated} of ${selected.length} complete`;
-
-    const charged = data.tokens_charged || data.files_generated || 0;
-    flash(`Generated ${data.files_generated} checklist(s) — ${charged} token(s) used`, 'success');
-    setText('generateStatus', `${data.files_generated} file(s) ready`);
-
+    if (count) count.textContent = `${data.generated_file_count || 0} of ${selected.length} complete`;
+    setText('generateStatus', `${data.generated_file_count || 0} file(s) ready`);
     renderDownloads(data);
     show('downloadSection');
-
-    if (data.errors && data.errors.length) {
-      data.errors.forEach(e => flash(`Warning: ${e}`, 'warn'));
-    }
-
+    if (data.errors && data.errors.length) data.errors.forEach(e => flash(`Warning: ${e}`, 'warn'));
+    flash(`Generated ${data.generated_file_count || 0} checklist(s). Tokens are charged on first download.`, 'success');
   } catch(e) {
-    clearInterval(anim);
-    if (bar)   bar.style.width = '100%';
+    if (bar) bar.style.width = '100%';
     if (badge) { badge.className = 'badge failed-all'; badge.textContent = '✗ Failed'; }
     flash(e.message || 'Generation failed', 'error');
-    setText('generateStatus', 'Failed — see message above');
+    setText('generateStatus', 'Generation failed');
   } finally {
     btn.disabled = false; btn.textContent = 'Generate Selected Checklists';
   }
 }
 
-// ── Render downloads ──────────────────────────────────────────────────────────
 function renderDownloads(data) {
   const list = document.getElementById('downloadList');
   if (!list) return;
   list.innerHTML = '';
-  (data.file_downloads || []).forEach(f => {
+  (data.files || []).forEach(f => {
     const div = document.createElement('div');
     div.className = 'download-item';
     div.innerHTML = `
       <span class="fname">📄 ${f.filename}</span>
-      <a href="${f.url}" download="${f.filename}">⬇ Download</a>
+      <a href="${f.download_url}" download="${f.filename}">⬇ Download</a>
     `;
     list.appendChild(div);
   });
-  if (data.zip_available && data.zip_download_url) {
+  if (data.zip && data.zip.download_url) {
     const zipBtn = document.createElement('button');
     zipBtn.className = 'primary zip-btn';
     zipBtn.textContent = '⬇ Download All (ZIP)';
-    zipBtn.onclick = () => { window.location.href = data.zip_download_url; };
+    zipBtn.onclick = () => { window.location.href = data.zip.download_url; };
     list.appendChild(zipBtn);
   }
 }

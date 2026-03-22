@@ -17,8 +17,10 @@ from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any
 import datetime as _dt
 import random
+import threading
+import logging
 
-from flask import Flask, render_template, request, jsonify, send_file, session
+from flask import Flask, render_template, request, jsonify, send_file, session, abort
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
 from werkzeug.exceptions import HTTPException
@@ -160,6 +162,20 @@ def _output_folder(tenant_id, user_id, session_id):
     p.mkdir(parents=True, exist_ok=True)
     return p
 
+
+def _session_meta_dir(tenant_id, user_id, session_id):
+    p = STORAGE_ROOT / str(tenant_id) / str(user_id) / 'sessions' / session_id
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def _extracted_json_path(tenant_id, user_id, session_id):
+    return _session_meta_dir(tenant_id, user_id, session_id) / 'extracted.json'
+
+
+def _reviewed_json_path(tenant_id, user_id, session_id):
+    return _session_meta_dir(tenant_id, user_id, session_id) / 'reviewed.json'
+
 # Legacy fallback paths (used by cleanup only)
 UPLOAD_FOLDER = STORAGE_ROOT / 'legacy_uploads'
 OUTPUT_FOLDER = STORAGE_ROOT / 'legacy_outputs'
@@ -191,16 +207,18 @@ DOCUMENT_FOLDERS = [
     "TRAININGS"
 ]
 
-CHECKLIST_TEMPLATES = [
-    "EXEMPLAR PROFILE",
-    "HC-One Profile",
-    "HEALTHCARE HOMES PROFILE",
-    "Horizon Care PROFILE",
-    "IRIS PROFILE",
-    "LC Profile",
-    "MHA PROFILE",
-    "neuven new"
+TEMPLATE_METADATA = [
+    {'template_key': 'exemplar_profile', 'template_name': 'EXEMPLAR PROFILE', 'file_name': 'EXEMPLAR PROFILE.docx', 'active': True, 'order': 1},
+    {'template_key': 'hc_one_profile', 'template_name': 'HC-One Profile', 'file_name': 'HC-One Profile.docx', 'active': True, 'order': 2},
+    {'template_key': 'healthcare_homes_profile', 'template_name': 'HEALTHCARE HOMES PROFILE', 'file_name': 'HEALTHCARE HOMES PROFILE.docx', 'active': True, 'order': 3},
+    {'template_key': 'horizon_care_profile', 'template_name': 'Horizon Care PROFILE', 'file_name': 'Horizon Care - PROFILE.docx', 'active': True, 'order': 4},
+    {'template_key': 'iris_profile', 'template_name': 'IRIS PROFILE', 'file_name': 'IRIS PROFILE.docx', 'active': True, 'order': 5},
+    {'template_key': 'lc_profile', 'template_name': 'LC Profile', 'file_name': 'LC Profile.docx', 'active': True, 'order': 6},
+    {'template_key': 'mha_profile', 'template_name': 'MHA PROFILE', 'file_name': 'MHA PROFILE.docx', 'active': True, 'order': 7},
+    {'template_key': 'neuven_new', 'template_name': 'neuven new', 'file_name': 'neuven new.docx', 'active': True, 'order': 8},
 ]
+
+STANDARD_FIELDS
 
 STANDARD_FIELDS = [
     "Candidate Name", "Title", "Forename(s)", "Surname", "Email",
@@ -1225,36 +1243,158 @@ def fill_docx_template(template_path: Path, output_path: Path, replacements: Dic
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
+def list_template_metadata() -> List[dict]:
+    metas = []
+    for item in sorted(TEMPLATE_METADATA, key=lambda x: x.get('order', 999)):
+        p = TEMPLATE_FOLDER / item['file_name']
+        if p.exists() and item.get('active', True):
+            metas.append(dict(item))
+    return metas
+
+
+def get_template_by_key(template_key: str) -> Optional[dict]:
+    for item in list_template_metadata():
+        if item['template_key'] == template_key:
+            return item
+    return None
+
+
 def list_templates() -> List[str]:
-    """Return template names (stems) that actually exist in templates_docx."""
+    return [t['template_name'] for t in list_template_metadata()]
+
+# ===== Checklist worker / queue =====
+CHECKLIST_GLOBAL_CONCURRENCY = max(1, int(os.getenv('CHECKLIST_MAX_CONCURRENT_PARENTS', '3')))
+_dispatcher_started = False
+_dispatcher_lock = threading.Lock()
+
+
+def _safe_filename_part(value: str, fallback: str = 'Candidate') -> str:
+    value = (value or '').strip() or fallback
+    value = re.sub(r'[\/:*?"<>|]+', ' ', value)
+    value = re.sub(r'\s+', '_', value).strip('._')
+    return value[:80] or fallback
+
+
+def _today_str() -> str:
+    return _dt.date.today().strftime('%Y%m%d')
+
+
+def _build_output_filename(candidate_name: str, template_name: str, output_folder: Path) -> str:
+    base = f"{_safe_filename_part(candidate_name)}_{_safe_filename_part(template_name, 'Checklist')}_{_today_str()}"
+    candidate = base + '.docx'
+    n = 2
+    while (output_folder / candidate).exists():
+        candidate = f"{base}_v{n}.docx"
+        n += 1
+    return candidate
+
+
+def _build_zip_filename(candidate_name: str) -> str:
+    return f"{_safe_filename_part(candidate_name)}_Checklist_{_today_str()}.zip"
+
+
+def _meaningful_extraction_success(extracted: Dict[str, FieldValue]) -> bool:
+    meaningful = 0
+    for _, fv in (extracted or {}).items():
+        val = (fv.value or '').strip() if hasattr(fv, 'value') else str(fv or '').strip()
+        if val and val.upper() not in {'NA', 'UK PASSPORT'}:
+            meaningful += 1
+    return meaningful >= 5
+
+
+def _write_json(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2), encoding='utf-8')
+
+
+def _read_json(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    return json.loads(path.read_text(encoding='utf-8'))
+
+
+def _run_checklist_extraction(job: dict):
+    import db
+    tenant_id = int(job['tenant_id']); user_id = int(job['user_id'])
+    session_id = job['session_id']; job_id = job['job_id']
     try:
-        return sorted([p.stem for p in TEMPLATE_FOLDER.glob("*.docx")])
-    except Exception:
-        return []
+        upload_folder = _upload_folder(tenant_id, user_id, session_id)
+        db.update_checklist_job(job_id, tenant_id, user_id, current_step='Checking priority folders and extracting fields')
+        extracted = smart_extract_with_priority(upload_folder)
+        if not _meaningful_extraction_success(extracted):
+            raise ValueError('No usable structured data could be extracted')
+        extracted_data = {field: {'value': fv.value, 'source': fv.source, 'confidence': fv.confidence} for field, fv in extracted.items()}
+        extracted_path = _extracted_json_path(tenant_id, user_id, session_id)
+        _write_json(extracted_path, extracted_data)
+        usage_id = None
+        if not job.get('extraction_token_charged'):
+            legacy_job_id = db.create_legacy_job_record(tenant_id=tenant_id, user_id=user_id, total_items=1, status='running')
+            usage_id = db.record_usage(tenant_id=tenant_id, user_id=user_id, db_job_id=legacy_job_id, successful_outputs=1)
+            if legacy_job_id:
+                db.update_legacy_job_status(db_job_id=legacy_job_id, status='completed', successful_items=1, failed_items=0)
+        db.update_checklist_job(job_id, tenant_id, user_id, status='extract_completed', current_step='Extraction completed', error_message=None, extracted_data_path=str(extracted_path), extraction_token_charged=True, extraction_token_charge_id=usage_id, extract_completed_at=_dt.datetime.utcnow())
+    except Exception as e:
+        app.logger.exception('[Checklist] extraction failed for %s', job_id)
+        db.update_checklist_job(job_id, tenant_id, user_id, status='extract_failed', current_step='Extraction failed', error_message=str(e))
+
+
+def _dispatcher_cycle():
+    import db
+    db.requeue_stale_running_jobs(minutes=30)
+    total_running = db.count_total_running_jobs()
+    if total_running >= CHECKLIST_GLOBAL_CONCURRENCY:
+        return
+    for job in db.list_queued_jobs(limit=50):
+        if total_running >= CHECKLIST_GLOBAL_CONCURRENCY:
+            break
+        plan_limit = 3 if 'standard' in str(job.get('plan_type') or '').lower() or 'premium' in str(job.get('plan_type') or '').lower() or 'pro' in str(job.get('plan_type') or '').lower() else 1
+        if db.count_running_jobs_for_user(int(job['tenant_id']), int(job['user_id'])) >= plan_limit:
+            continue
+        if db.claim_queued_job(job['job_id']):
+            total_running += 1
+            threading.Thread(target=_run_checklist_extraction, args=(job,), daemon=True, name=f"checklist-{job['job_id'][:8]}").start()
+
+
+def _dispatcher_loop():
+    while True:
+        try:
+            _dispatcher_cycle()
+        except Exception:
+            app.logger.exception('[Checklist] dispatcher loop error')
+        time.sleep(2)
+
+
+def _ensure_dispatcher_started():
+    global _dispatcher_started
+    with _dispatcher_lock:
+        if _dispatcher_started:
+            return
+        try:
+            import db
+            db.ensure_schema()
+        except Exception:
+            app.logger.exception('[Checklist] ensure_schema failed')
+        threading.Thread(target=_dispatcher_loop, daemon=True, name='checklist-dispatcher').start()
+        _dispatcher_started = True
+
 
 # ===== FLASK ROUTES =====
 
+@app.before_request
+def _start_bg_worker():
+    _ensure_dispatcher_started()
+
+
 @app.route('/')
 def index():
-    # Auth check — redirect to login if not authenticated
     ctx = _get_ctx()
-    if not ctx:
-        return render_template('index.html',
-                             folders=DOCUMENT_FOLDERS,
-                             templates=list_templates(),
-                             fields=STANDARD_FIELDS,
-                             auth_required=True)
-    return render_template('index.html',
-                         folders=DOCUMENT_FOLDERS,
-                         templates=list_templates(),
-                         fields=STANDARD_FIELDS,
-                         auth_required=False)
+    return render_template('index.html', folders=DOCUMENT_FOLDERS, templates=list_templates(), fields=STANDARD_FIELDS, auth_required=not bool(ctx))
+
 
 @app.route('/templates', methods=['GET'])
 def templates_api():
-    """Return templates present on the server."""
     _require_auth()
-    return jsonify({'success': True, 'templates': list_templates()})
+    return jsonify({'success': True, 'templates': list_template_metadata()})
 
 
 @app.route('/upload', methods=['POST'])
@@ -1264,328 +1404,338 @@ def upload_files():
     try:
         cleanup_old_sessions()
         session_id = str(uuid.uuid4())
+        job_id = f"chk_{uuid.uuid4().hex}"
         session_folder = _upload_folder(tenant_id, user_id, session_id)
-        
         upload_stats = {}
-        
+        total_files = 0
         for folder_name in DOCUMENT_FOLDERS:
             folder_path = session_folder / folder_name
-            folder_path.mkdir(exist_ok=True)
-            
+            folder_path.mkdir(parents=True, exist_ok=True)
             field_name = f'files_{folder_name.replace(" ", "_")}'
             files = request.files.getlist(field_name)
-            
             count = 0
-            for file in files[:5]:  # Max 5 files per folder
+            for file in files[:5]:
                 if file and allowed_file(file.filename):
                     filename = secure_filename(file.filename)
                     file.save(folder_path / filename)
                     count += 1
-            
+                    total_files += 1
             upload_stats[folder_name] = count
-        
-        # Also handle template uploads
-        template_files = request.files.getlist('template_files')
-        template_count = 0
-        for file in template_files:
-            if file and file.filename.endswith('.docx'):
-                filename = secure_filename(file.filename)
-                file.save(TEMPLATE_FOLDER / filename)
-                template_count += 1
-        
+        if total_files == 0:
+            return jsonify({'success': False, 'error_message': 'Please upload at least one supported file.'}), 400
+        import db
+        db.create_checklist_job(job_id=job_id, session_id=session_id, tenant_id=tenant_id, user_id=user_id,
+                                plan_type=ctx.get('plan_name') or '', upload_path=str(session_folder), uploaded_file_count=total_files)
         session['session_id'] = session_id
         session['tenant_id'] = tenant_id
-        session['user_id']   = user_id
-
-        return jsonify({
-            'success': True,
-            'session_id': session_id,
-            'upload_stats': upload_stats,
-            'template_count': template_count
-        })
-    
+        session['user_id'] = user_id
+        return jsonify({'success': True, 'job_id': job_id, 'session_id': session_id, 'status': 'uploaded', 'uploaded_file_count': total_files, 'upload_stats': upload_stats, 'message': 'Files uploaded successfully.'})
     except Exception as e:
-        traceback.print_exc()
-        return jsonify({'error': str(e)}), 500
+        app.logger.exception('upload failed')
+        return jsonify({'success': False, 'error_message': str(e)}), 500
+
 
 @app.route('/extract', methods=['POST'])
 def extract_data():
-    """Extract data using smart priority logic. Charges 1 token."""
     ctx = _require_auth()
     tenant_id = ctx['tenant_id']; user_id = ctx['user_id']
+    data = request.get_json(silent=True) or {}
+    job_id = data.get('job_id')
+    session_id = data.get('session_id')
+    if not job_id or not session_id:
+        return jsonify({'success': False, 'error_message': 'Missing job_id or session_id'}), 400
     try:
-        cleanup_old_sessions()
-        data = request.json
-        session_id = data.get('session_id')
-
-        if not session_id:
-            return jsonify({'error': 'No session ID provided'}), 400
-
-        # Token check before extraction
-        try:
-            import db
-            tokens = db.get_tenant_tokens_remaining(tenant_id)
-            if tokens == 0:
-                return jsonify({'error': 'No tokens remaining. Please contact NextStep to top up.'}), 402
-        except Exception as e:
-            app.logger.warning("[Extract] Token check skipped: %s", e)
-
-        session_folder = _upload_folder(tenant_id, user_id, session_id)
-
-        if not session_folder.exists():
-            return jsonify({'error': 'Session folder not found'}), 404
-        
-        print(f"Extracting with smart priority from: {session_folder}")
-        
-        extracted = smart_extract_with_priority(session_folder)
-        
-        # Convert to JSON-serializable format
-        extracted_data = {}
-        for field, field_value in extracted.items():
-            extracted_data[field] = {
-                'value': field_value.value,
-                'source': field_value.source,
-                'confidence': field_value.confidence
-            }
-        
-        # Charge 1 token for extraction
-        try:
-            import db
-            db_job_id = db.create_job_record(tenant_id=tenant_id, user_id=user_id, total_items=1)
-            db.update_job_status(db_job_id=db_job_id, status='completed',
-                                 successful_items=1, failed_items=0)
-            db.record_usage(tenant_id=tenant_id, user_id=user_id,
-                            db_job_id=db_job_id, successful_outputs=1)
-        except Exception as e:
-            app.logger.warning("[Extract] Token charge failed: %s", e)
-
-        return jsonify({
-            'success': True,
-            'extracted_data': extracted_data
-        })
-
+        import db
+        tokens = db.get_tenant_tokens_remaining(tenant_id)
+        if tokens == 0:
+            return jsonify({'success': False, 'error_message': 'No tokens remaining. Please contact NextStep to top up.'}), 402
+        job = db.get_checklist_job(job_id, tenant_id, user_id)
+        if not job or job.get('session_id') != session_id:
+            return jsonify({'success': False, 'error_message': 'Job not found'}), 404
+        if not db.queue_checklist_job(job_id, session_id, tenant_id, user_id):
+            return jsonify({'success': False, 'error_message': 'Job cannot be queued from its current state.'}), 409
+        return jsonify({'success': True, 'job_id': job_id, 'session_id': session_id, 'status': 'extract_queued', 'message': 'Extraction queued successfully.'})
     except Exception as e:
-        traceback.print_exc()
-        return jsonify({'error': str(e)}), 500
+        app.logger.exception('extract queue failed')
+        return jsonify({'success': False, 'error_message': str(e)}), 500
 
+
+@app.route('/extract/status/<job_id>', methods=['GET'])
+def extract_status(job_id):
+    ctx = _require_auth()
+    import db
+    job = db.get_checklist_job(job_id, ctx['tenant_id'], ctx['user_id'])
+    if not job:
+        return jsonify({'success': False, 'error_message': 'Job not found'}), 404
+    success = job['status'] != 'extract_failed'
+    return jsonify({
+        'success': success,
+        'job_id': job['job_id'],
+        'session_id': job['session_id'],
+        'status': job['status'],
+        'current_step': job.get('current_step'),
+        'error_message': job.get('error_message'),
+        'review_ready': job['status'] == 'extract_completed',
+    }), (200 if success else 500)
+
+
+@app.route('/extracted/<session_id>', methods=['GET'])
+def get_extracted(session_id):
+    ctx = _require_auth()
+    import db
+    job = db.get_job_by_session(session_id, ctx['tenant_id'], ctx['user_id'])
+    if not job:
+        return jsonify({'success': False, 'error_message': 'Session not found'}), 404
+    if job['status'] not in ('extract_completed', 'review_ready', 'generating', 'generated'):
+        return jsonify({'success': False, 'error_message': 'Extraction not completed yet'}), 409
+    path = Path(job.get('reviewed_data_path') or job.get('extracted_data_path') or _extracted_json_path(ctx['tenant_id'], ctx['user_id'], session_id))
+    data = _read_json(path)
+    return jsonify({'success': True, 'session_id': session_id, 'status': job['status'], 'data': data})
+
+
+@app.route('/review/<session_id>', methods=['POST'])
+def save_review(session_id):
+    ctx = _require_auth()
+    payload = request.get_json(silent=True) or {}
+    review_data = payload.get('data') or payload.get('field_values') or {}
+    import db
+    job = db.get_job_by_session(session_id, ctx['tenant_id'], ctx['user_id'])
+    if not job:
+        return jsonify({'success': False, 'error_message': 'Session not found'}), 404
+    reviewed_path = _reviewed_json_path(ctx['tenant_id'], ctx['user_id'], session_id)
+    _write_json(reviewed_path, review_data)
+    db.update_checklist_job(job['job_id'], ctx['tenant_id'], ctx['user_id'], status='review_ready', reviewed_data_path=str(reviewed_path), current_step='Review saved')
+    return jsonify({'success': True, 'session_id': session_id, 'status': 'review_ready', 'message': 'Reviewed data saved successfully.'})
+
+
+@app.route('/generate', methods=['POST'])
 @app.route('/process', methods=['POST'])
 def process_documents():
-    """Generate filled checklist documents. Charges 1 token per template generated."""
     ctx = _require_auth()
     tenant_id = ctx['tenant_id']; user_id = ctx['user_id']
     try:
-        cleanup_old_sessions()
-        data = request.json
-        session_id = data.get('session_id')
-        field_values = data.get('field_values', {})
-        selected_templates = data.get('selected_templates', [])
+        payload = request.get_json(silent=True) or {}
+        job_id = payload.get('job_id')
+        session_id = payload.get('session_id')
+        selected_template_keys = payload.get('selected_templates') or []
+        if not session_id or not job_id:
+            return jsonify({'success': False, 'error_message': 'Missing session_id or job_id'}), 400
+        if not selected_template_keys:
+            return jsonify({'success': False, 'error_message': 'No templates selected'}), 400
+        import db
+        job = db.get_checklist_job(job_id, tenant_id, user_id)
+        if not job or job.get('session_id') != session_id:
+            return jsonify({'success': False, 'error_message': 'Job not found'}), 404
+        if job['status'] not in ('extract_completed', 'review_ready', 'generated', 'generation_failed'):
+            return jsonify({'success': False, 'error_message': 'Review is not ready yet'}), 409
+        db.update_checklist_job(job_id, tenant_id, user_id, status='generating', current_step='Generating checklists')
 
-        if not session_id:
-            return jsonify({'error': 'No session ID'}), 400
-
-        if not selected_templates:
-            return jsonify({'error': 'No templates selected'}), 400
-
-        # Token check — need enough for all selected templates
-        try:
-            import db
-            tokens = db.get_tenant_tokens_remaining(tenant_id)
-            if tokens == 0:
-                return jsonify({'error': 'No tokens remaining. Please contact NextStep to top up.'}), 402
-            if 0 < tokens < len(selected_templates):
-                selected_templates = selected_templates[:tokens]
-                app.logger.warning("[Process] Trimmed to %d templates (token limit)", len(selected_templates))
-        except Exception as e:
-            app.logger.warning("[Process] Token check skipped: %s", e)
+        field_values = payload.get('field_values') or {}
+        if not field_values:
+            reviewed_path = Path(job.get('reviewed_data_path') or _reviewed_json_path(tenant_id, user_id, session_id))
+            if reviewed_path.exists():
+                field_values = _read_json(reviewed_path)
+            else:
+                field_values = _read_json(Path(job.get('extracted_data_path') or _extracted_json_path(tenant_id, user_id, session_id)))
+        # flatten API extracted structure if needed
+        flat_field_values = {}
+        for k, v in (field_values or {}).items():
+            if isinstance(v, dict):
+                flat_field_values[k] = v.get('value', '')
+            else:
+                flat_field_values[k] = v
+        reviewed_path = _reviewed_json_path(tenant_id, user_id, session_id)
+        _write_json(reviewed_path, flat_field_values)
 
         output_folder = _output_folder(tenant_id, user_id, session_id)
         if output_folder.exists():
             shutil.rmtree(output_folder)
         output_folder.mkdir(parents=True, exist_ok=True)
-        
-        generated_files = []
-        errors = []
-        
-        full_name = (field_values.get("Candidate Name") or "").strip()
+
+        full_name = (flat_field_values.get('Candidate Name') or '').strip()
+        if not full_name:
+            full_name = 'Candidate'
         name_parts = full_name.split()
-        first_name = name_parts[0] if name_parts else ""
-        last_name = name_parts[-1] if len(name_parts) > 1 else ""
-        
-        role = (field_values.get("Role") or "").strip()
-        yes_na = "NA" if role.upper() == "HCA" else "YES"
-        todays = _dt.date.today().strftime("%d/%m/%Y")
-        
-        nationality = (field_values.get("Nationality") or "").strip().lower()
-        if "british" in nationality or "uk" in nationality:
-            field_values["RTW Status"] = "UK Passport"
-            field_values["Visa Expiry Date"] = "UK Passport"
-            field_values["Visa Type"] = "UK Passport"
-            field_values["Restriction"] = "UK Passport"
-            field_values["Share Code"] = "UK Passport"
-        
+        first_name = name_parts[0] if name_parts else ''
+        last_name = name_parts[-1] if len(name_parts) > 1 else ''
+        role = (flat_field_values.get('Role') or '').strip()
+        yes_na = 'NA' if role.upper() == 'HCA' else 'YES'
+        todays = _dt.date.today().strftime('%d/%m/%Y')
+        nationality = (flat_field_values.get('Nationality') or '').strip().lower()
+        if 'british' in nationality or nationality == 'uk':
+            for k in ['RTW Status', 'Visa Expiry Date', 'Visa Type', 'Restriction', 'Share Code']:
+                flat_field_values[k] = 'UK Passport'
         replacements = {
-            "Candidate Name": full_name,
-            "Candidate First Name": first_name,
-            "Candidate First name": first_name,
-            "Candidate surname": last_name,
-            "Candidate last name": last_name,
-            "Candidate Address": field_values.get("Address", ""),
-            "Candidate address": field_values.get("Address", ""),
-            "Address": field_values.get("Address", ""),
-            "Candidate Mobile Number": field_values.get("Phone", ""),
-            "Phone": field_values.get("Phone", ""),
-            "DOB": field_values.get("DOB", ""),
-            "D.O.B": field_values.get("DOB", ""),
-            "Date Of Birth": field_values.get("DOB", ""),
-            "Nationality": field_values.get("Nationality", ""),
-            "HCA/RGN": role,
-            " HCA/RGN": role,
-            "NI Number": field_values.get("NI Number", ""),
-            "NMC Pin Number": field_values.get("NMC PIN", ""),
-            "NMC Pin number": field_values.get("NMC PIN", ""),
-            "NMC pin": field_values.get("NMC PIN", ""),
-            "DBS Certificate Number": field_values.get("DBS Number", ""),
-            "DBS certificate number": field_values.get("DBS Number", ""),
-            "DBS Certificate issue date": field_values.get("DBS Issue Date", ""),
-            "DBS certificate issue date": field_values.get("DBS Issue Date", ""),
-            "DBS Certificate last checked date": field_values.get("DBS Last Checked Date", ""),
-            "DBS last checked date": field_values.get("DBS Last Checked Date", ""),
-            "DBS expiry date": field_values.get("DBS Last Checked Date", ""),
-            "Training completion date": field_values.get("Training Date", ""),
-            "Training expiry date": field_values.get("Training Expiry Date", ""),
-            "Right to work expiry date": field_values.get("Visa Expiry Date", ""),
-            "Right To Work Expiry Date": field_values.get("Visa Expiry Date", ""),
-            "Type of visa": field_values.get("Visa Type", ""),
-            "Restriction": field_values.get("Restriction", ""),
-            "Today's Date": todays,
-            "Today's date": todays,
-            "YES/NA": yes_na,
-            "Candidate share code": field_values.get("Share Code", ""),
+            'Candidate Name': full_name, 'Candidate First Name': first_name, 'Candidate First name': first_name,
+            'Candidate surname': last_name, 'Candidate last name': last_name,
+            'Candidate Address': flat_field_values.get('Address', ''), 'Candidate address': flat_field_values.get('Address', ''),
+            'Address': flat_field_values.get('Address', ''), 'Candidate Mobile Number': flat_field_values.get('Phone', ''),
+            'Phone': flat_field_values.get('Phone', ''), 'DOB': flat_field_values.get('DOB', ''), 'D.O.B': flat_field_values.get('DOB', ''),
+            'Date Of Birth': flat_field_values.get('DOB', ''), 'Nationality': flat_field_values.get('Nationality', ''),
+            'HCA/RGN': role, ' HCA/RGN': role, 'NI Number': flat_field_values.get('NI Number', ''),
+            'NMC Pin Number': flat_field_values.get('NMC PIN', ''), 'NMC Pin number': flat_field_values.get('NMC PIN', ''),
+            'NMC pin': flat_field_values.get('NMC PIN', ''), 'DBS Certificate Number': flat_field_values.get('DBS Number', ''),
+            'DBS certificate number': flat_field_values.get('DBS Number', ''), 'DBS Certificate issue date': flat_field_values.get('DBS Issue Date', ''),
+            'DBS certificate issue date': flat_field_values.get('DBS Issue Date', ''), 'DBS Certificate last checked date': flat_field_values.get('DBS Last Checked Date', ''),
+            'DBS last checked date': flat_field_values.get('DBS Last Checked Date', ''), 'DBS expiry date': flat_field_values.get('DBS Last Checked Date', ''),
+            'Training completion date': flat_field_values.get('Training Date', ''), 'Training expiry date': flat_field_values.get('Training Expiry Date', ''),
+            'Right to work expiry date': flat_field_values.get('Visa Expiry Date', ''), 'Right To Work Expiry Date': flat_field_values.get('Visa Expiry Date', ''),
+            'Type of visa': flat_field_values.get('Visa Type', ''), 'Restriction': flat_field_values.get('Restriction', ''),
+            "Today's Date": todays, "Today's date": todays, 'YES/NA': yes_na, 'Candidate share code': flat_field_values.get('Share Code', ''),
         }
+        for k, v in flat_field_values.items():
+            replacements.setdefault(k, v or '')
 
-        # Also include canonical field names directly (mapping engine handles variations/typos)
-        for k, v in (field_values or {}).items():
-            if k not in replacements:
-                replacements[k] = v or ""
-
-
-        
-        for template_name in selected_templates:
-            template_path = TEMPLATE_FOLDER / f"{template_name}.docx"
-            
-            if not template_path.exists():
-                errors.append(f"Template not found: {template_name}.docx")
-                continue
-            
-            output_path = output_folder / f"{template_name}_filled.docx"
-            
-            try:
-                replaced, warnings = fill_docx_template(template_path, output_path, replacements)
-                generated_files.append(output_path.name)
-                
-                if warnings:
-                    errors.extend([f"{template_name}: {w}" for w in warnings])
-            
-            except Exception as e:
-                errors.append(f"{template_name}: {str(e)}")
-        
-        if generated_files:
-            zip_path = output_folder / 'checklists.zip'
-            with zipfile.ZipFile(zip_path, 'w') as zipf:
-                for file in output_folder.glob('*.docx'):
-                    zipf.write(file, file.name)
-
-        # Charge 1 token per successfully generated template
-        successful_count = len(generated_files)
-        if successful_count > 0:
-            try:
-                import db
-                db_job_id = db.create_job_record(tenant_id=tenant_id, user_id=user_id,
-                                                  total_items=successful_count)
-                db.update_job_status(db_job_id=db_job_id, status='completed',
-                                     successful_items=successful_count, failed_items=len(errors))
-                db.record_usage(tenant_id=tenant_id, user_id=user_id,
-                                db_job_id=db_job_id, successful_outputs=successful_count)
-            except Exception as e:
-                app.logger.warning("[Process] Token charge failed: %s", e)
-
-        # Build download URLs using isolated path
+        generated_files = []
         file_downloads = []
-        for fn in generated_files:
-            file_downloads.append({'filename': fn, 'url': f'/download/{session_id}/{fn}'})
-
-        return jsonify({
-            'success': True,
-            'files_generated': successful_count,
-            'generated_files': generated_files,
-            'file_downloads': file_downloads,
-            'tokens_charged': successful_count,
-            'zip_available': (output_folder / 'checklists.zip').exists(),
-            'zip_download_url': f'/download/{session_id}/checklists.zip' if (output_folder / 'checklists.zip').exists() else '',
-            'errors': errors
-        })
-    
+        output_rows = []
+        errors = []
+        for template_key in selected_template_keys:
+            tmpl = get_template_by_key(template_key)
+            if not tmpl:
+                errors.append(f'Invalid template: {template_key}')
+                continue
+            template_path = TEMPLATE_FOLDER / tmpl['file_name']
+            if not template_path.exists():
+                errors.append(f"Template not found: {tmpl['file_name']}")
+                continue
+            output_filename = _build_output_filename(full_name, tmpl['template_name'], output_folder)
+            output_path = output_folder / output_filename
+            try:
+                _, warnings = fill_docx_template(template_path, output_path, replacements)
+                if warnings:
+                    errors.extend([f"{tmpl['template_name']}: {w}" for w in warnings])
+                generated_files.append(output_filename)
+                file_downloads.append({'filename': output_filename, 'download_url': f'/download/{session_id}/{output_filename}', 'billed': False, 'template_key': tmpl['template_key'], 'template_name': tmpl['template_name']})
+                output_rows.append({'output_id': f"out_{uuid.uuid4().hex}", 'template_key': tmpl['template_key'], 'template_name': tmpl['template_name'], 'output_filename': output_filename, 'output_path': str(output_path)})
+            except Exception as e:
+                errors.append(f"{tmpl['template_name']}: {str(e)}")
+        zip_name = ''
+        zip_url = ''
+        if generated_files:
+            zip_name = _build_zip_filename(full_name)
+            zip_path = output_folder / zip_name
+            with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED) as zipf:
+                for fn in generated_files:
+                    zipf.write(output_folder / fn, fn)
+            zip_url = f'/download-zip/{session_id}'
+        # replace output rows for session by clearing existing output files table rows from DB not implemented; simple append can duplicate if repeated
+        # safer: delete old rows for session owner
+        s = db.get_session()
+        if s:
+            try:
+                s.execute(__import__('sqlalchemy').text('DELETE FROM checklist_outputs WHERE session_id = :session_id AND tenant_id = :tenant_id AND user_id = :user_id'), {'session_id': session_id, 'tenant_id': tenant_id, 'user_id': user_id})
+                s.commit()
+            except Exception:
+                s.rollback()
+            finally:
+                s.close()
+        if output_rows:
+            db.save_output_rows(job_id=job_id, session_id=session_id, tenant_id=tenant_id, user_id=user_id, outputs=output_rows)
+        db.update_checklist_job(job_id, tenant_id, user_id, status='generated' if output_rows else 'generation_failed', current_step='Generation completed' if output_rows else 'Generation failed', reviewed_data_path=str(reviewed_path), output_path=str(output_folder), generated_file_count=len(output_rows), generated_at=_dt.datetime.utcnow(), error_message='; '.join(errors[:20]) if errors else None)
+        return jsonify({'success': bool(output_rows), 'job_id': job_id, 'session_id': session_id, 'status': 'generated' if output_rows else 'generation_failed', 'generated_file_count': len(output_rows), 'files': file_downloads, 'zip': {'filename': zip_name, 'download_url': zip_url} if zip_url else None, 'errors': errors})
     except Exception as e:
-        traceback.print_exc()
-        return jsonify({'error': str(e)}), 500
+        app.logger.exception('generation failed')
+        try:
+            import db
+            if job_id:
+                db.update_checklist_job(job_id, tenant_id, user_id, status='generation_failed', current_step='Generation failed', error_message=str(e))
+        except Exception:
+            pass
+        return jsonify({'success': False, 'error_message': str(e), 'status': 'generation_failed'}), 500
+
+
+@app.route('/outputs/<session_id>', methods=['GET'])
+def outputs_api(session_id):
+    ctx = _require_auth()
+    import db
+    outputs = db.list_outputs(session_id, ctx['tenant_id'], ctx['user_id'])
+    job = db.get_job_by_session(session_id, ctx['tenant_id'], ctx['user_id'])
+    zip_url = f'/download-zip/{session_id}' if outputs else ''
+    zip_name = _build_zip_filename(((_read_json(Path(job.get('reviewed_data_path') or '')) or {}).get('Candidate Name') if job and job.get('reviewed_data_path') else 'Candidate')) if outputs else ''
+    files = [{'template_key': o.get('template_key'), 'template_name': o.get('template_name'), 'filename': o.get('output_filename'), 'download_url': f"/download/{session_id}/{o.get('output_filename')}", 'download_token_charged': bool(o.get('download_token_charged'))} for o in outputs]
+    return jsonify({'success': True, 'session_id': session_id, 'status': job.get('status') if job else 'generated', 'files': files, 'zip': {'filename': zip_name, 'download_url': zip_url} if zip_url else None})
+
+
+def _charge_for_single_output(ctx, output_row):
+    import db
+    if output_row.get('download_token_charged'):
+        db.mark_output_downloaded(output_row['output_id'], ctx['tenant_id'], ctx['user_id'], charge_now=False)
+        return True
+    if db.get_tenant_tokens_remaining(ctx['tenant_id']) == 0:
+        return False
+    legacy_job_id = db.create_legacy_job_record(tenant_id=ctx['tenant_id'], user_id=ctx['user_id'], total_items=1, status='running')
+    usage_id = db.record_usage(tenant_id=ctx['tenant_id'], user_id=ctx['user_id'], db_job_id=legacy_job_id, successful_outputs=1)
+    if legacy_job_id:
+        db.update_legacy_job_status(db_job_id=legacy_job_id, status='completed', successful_items=1, failed_items=0)
+    db.mark_output_downloaded(output_row['output_id'], ctx['tenant_id'], ctx['user_id'], charge_usage_id=usage_id, charge_now=True)
+    return True
+
 
 @app.route('/download/<session_id>/<filename>')
 def download(session_id, filename):
-    """Download generated files — auth + ownership check."""
     ctx = _require_auth()
     tenant_id = ctx['tenant_id']; user_id = ctx['user_id']
-    try:
-        # Only serve files from this user's isolated output folder
-        file_path = _output_folder(tenant_id, user_id, session_id) / filename
+    safe_name = Path(filename).name
+    import db
+    output_row = db.get_output_by_filename(session_id, tenant_id, user_id, safe_name)
+    if not output_row:
+        return jsonify({'success': False, 'error_message': 'File not found or access denied.'}), 404
+    file_path = Path(output_row['output_path'])
+    if not file_path.exists():
+        return jsonify({'success': False, 'error_message': 'File not found or expired.'}), 404
+    if not _charge_for_single_output(ctx, output_row):
+        return jsonify({'success': False, 'error_message': 'No tokens remaining. Please contact NextStep to top up.'}), 402
+    return send_file(file_path, as_attachment=True, download_name=safe_name)
 
-        if not file_path.exists():
-            return jsonify({'error': 'File not found or expired'}), 404
 
-        # Schedule cleanup after ZIP download
-        import threading, time as _time
-        def _cleanup_later():
-            _time.sleep(600)  # 10 minutes
-            try:
-                up = _upload_folder(tenant_id, user_id, session_id)
-                out = _output_folder(tenant_id, user_id, session_id)
-                import shutil as _sh
-                if up.exists(): _sh.rmtree(up, ignore_errors=True)
-                if out.exists(): _sh.rmtree(out, ignore_errors=True)
-                app.logger.info("[Cleanup] Deleted session %s", session_id)
-            except Exception as e:
-                app.logger.warning("[Cleanup] %s", e)
+@app.route('/download-zip/<session_id>')
+def download_zip(session_id):
+    ctx = _require_auth()
+    import db
+    outputs = db.list_outputs(session_id, ctx['tenant_id'], ctx['user_id'])
+    if not outputs:
+        return jsonify({'success': False, 'error_message': 'No generated files available for download.'}), 404
+    job = db.get_job_by_session(session_id, ctx['tenant_id'], ctx['user_id'])
+    output_folder = _output_folder(ctx['tenant_id'], ctx['user_id'], session_id)
+    reviewed = _read_json(_reviewed_json_path(ctx['tenant_id'], ctx['user_id'], session_id))
+    zip_name = _build_zip_filename(reviewed.get('Candidate Name') or 'Candidate')
+    zip_path = output_folder / zip_name
+    unbilled = [o for o in outputs if not o.get('download_token_charged')]
+    need = len(unbilled)
+    if need > 0:
+        tokens = db.get_tenant_tokens_remaining(ctx['tenant_id'])
+        if 0 <= tokens < need:
+            return jsonify({'success': False, 'error_message': f'Not enough tokens for ZIP download. Need {need} token(s).'}), 402
+        legacy_job_id = db.create_legacy_job_record(tenant_id=ctx['tenant_id'], user_id=ctx['user_id'], total_items=need or 1, status='running')
+        usage_id = db.record_usage(tenant_id=ctx['tenant_id'], user_id=ctx['user_id'], db_job_id=legacy_job_id, successful_outputs=need) if need else None
+        if legacy_job_id:
+            db.update_legacy_job_status(db_job_id=legacy_job_id, status='completed', successful_items=need, failed_items=0)
+        for out in outputs:
+            db.mark_output_downloaded(out['output_id'], ctx['tenant_id'], ctx['user_id'], charge_usage_id=usage_id if out in unbilled else None, charge_now=out in unbilled)
+    else:
+        for out in outputs:
+            db.mark_output_downloaded(out['output_id'], ctx['tenant_id'], ctx['user_id'], charge_now=False)
+    if not zip_path.exists():
+        with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED) as zipf:
+            for out in outputs:
+                fp = Path(out['output_path'])
+                if fp.exists():
+                    zipf.write(fp, arcname=out['output_filename'])
+    return send_file(zip_path, as_attachment=True, download_name=zip_name)
 
-        if filename.endswith('.zip'):
-            threading.Thread(target=_cleanup_later, daemon=True).start()
-
-        return send_file(file_path, as_attachment=True)
-
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
 
 @app.route('/health')
 def health_check():
-    """Health check endpoint"""
-    return jsonify({
-        'status': 'healthy',
-        'gemini_configured': bool(gemini_client),
-        'tesseract_available': bool(pytesseract),
-        'pdfplumber_available': bool(pdfplumber),
-        'pymupdf_available': bool(fitz),
-        'model_fast': GEMINI_MODEL_FAST,
-        'model_strong': GEMINI_MODEL_STRONG,
-        'db': bool(os.getenv('DATABASE_URL')),
-    })
+    return jsonify({'status': 'healthy', 'gemini_configured': bool(gemini_client), 'tesseract_available': bool(pytesseract), 'pdfplumber_available': bool(pdfplumber), 'pymupdf_available': bool(fitz), 'model_fast': GEMINI_MODEL_FAST, 'model_strong': GEMINI_MODEL_STRONG, 'db': bool(os.getenv('DATABASE_URL')), 'checklist_global_concurrency': CHECKLIST_GLOBAL_CONCURRENCY})
+
 
 if __name__ == '__main__':
-    print("="*60)
-    print("Compliance Checklist Automation - Web App")
-    print("COMPLETE VERSION with Smart Extraction Logic")
-    print("="*60)
-    print(f"Gemini API configured: {bool(gemini_client)}")
-    print(f"Tesseract OCR available: {bool(pytesseract)}")
-    print(f"PDF extraction available: {bool(pdfplumber)}")
-    print(f"Document folders: {len(DOCUMENT_FOLDERS)}")
-    print(f"Templates configured: {len(CHECKLIST_TEMPLATES)}")
-    print("="*60)
+    print('='*60)
+    print('Compliance Checklist Automation - Web App')
+    print('Queued extraction + isolated checklist generation')
+    print('='*60)
+    print(f'Gemini API configured: {bool(gemini_client)}')
+    print(f'Database configured: {bool(os.getenv("DATABASE_URL"))}')
+    _ensure_dispatcher_started()
     app.run(debug=True, host='0.0.0.0', port=5000)
