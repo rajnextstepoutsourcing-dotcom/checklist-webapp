@@ -218,8 +218,6 @@ TEMPLATE_METADATA = [
     {'template_key': 'neuven_new', 'template_name': 'neuven new', 'file_name': 'neuven new.docx', 'active': True, 'order': 8},
 ]
 
-STANDARD_FIELDS
-
 STANDARD_FIELDS = [
     "Candidate Name", "Title", "Forename(s)", "Surname", "Email",
     "Address", "Phone", "DOB", "Nationality", "NI Number",
