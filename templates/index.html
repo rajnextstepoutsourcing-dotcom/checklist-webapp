@@ -49,8 +49,8 @@
     .divider{height:1px;background:rgba(255,255,255,.10);margin:14px 0;}
 
     /* ── Folder grid ── */
-    .folder-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:10px;margin-bottom:14px;}
-    .folder-card{background:rgba(0,0,0,.18);border:2px dashed rgba(255,255,255,.14);border-radius:var(--radius-sm);padding:14px;cursor:pointer;transition:border-color .2s,background .2s;position:relative;}
+    .folder-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-bottom:14px;}
+    .folder-card{background:rgba(0,0,0,.18);border:2px dashed rgba(255,255,255,.14);border-radius:var(--radius-sm);padding:16px;min-height:190px;cursor:pointer;transition:border-color .2s,background .2s;position:relative;display:flex;flex-direction:column;justify-content:flex-start;}
     .folder-card:hover{border-color:rgba(37,99,235,.45);background:rgba(37,99,235,.06);}
     .folder-card.has-files{border-style:solid;border-color:rgba(34,197,94,.35);background:rgba(34,197,94,.06);}
     .folder-name{font-weight:700;font-size:14px;margin-bottom:6px;}
@@ -60,7 +60,7 @@
     .folder-file-name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text);}
     .folder-file-remove{border:1px solid rgba(239,68,68,.35);background:rgba(239,68,68,.12);color:#fecaca;border-radius:8px;padding:4px 8px;font-size:11px;cursor:pointer;position:relative;z-index:2;}
     .folder-note{font-size:11px;color:var(--muted2);margin-top:auto;position:relative;z-index:1;}
-    .folder-input{position:absolute;inset:0;opacity:0;cursor:pointer;width:100%;height:100%;}
+    .folder-input{display:none;}
 
     /* ── Fields grid ── */
     .fields-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:10px;}
@@ -139,7 +139,7 @@
     <a href="{{ dashboard_url }}" class="btn-back">← Dashboard</a>
   </div>
 
-  {% if auth_required %}
+  {% if auth_required and not has_token %}
   <div class="auth-warning">
     <span>⚠</span>
     <span>You must be logged in to use this tool. <a href="{{ login_url }}">Log in here</a></span>
@@ -161,7 +161,7 @@
     <p class="muted small" style="margin-bottom:12px;">Upload files into each relevant folder. Candidate data will be extracted automatically.</p>
     <div class="folder-grid" id="folderGrid">
       {% for folder in folders %}
-      <div class="folder-card" id="fc_{{ folder.replace(' ','_') }}" onclick="document.getElementById('fi_{{ folder.replace(' ','_') }}').click()">
+      <div class="folder-card" id="fc_{{ folder.replace(' ','_') }}" onclick="openFolderPicker('{{ folder }}', event)">
         <input type="file" id="fi_{{ folder.replace(' ','_') }}" class="folder-input" multiple
                accept=".pdf,.png,.jpg,.jpeg,.docx,.txt"
                data-folder="{{ folder }}" onchange="onFolderFiles(this)"/>
@@ -173,11 +173,9 @@
       {% endfor %}
     </div>
     <div class="row">
-      <button id="btnUpload" class="primary" onclick="doUpload()">Upload Files</button>
       <span id="uploadStatus" class="muted"></span>
-      <button id="btnExtract" class="ghost" onclick="startExtraction()" disabled>Extract</button>
+      <button id="btnExtract" class="primary" onclick="startExtraction()">Extract</button>
     </div>
-    <div class="token-info">ℹ Successful extraction uses <strong>1 token</strong>. Missing some fields is still valid if usable data is extracted.</div>
   </section>
 
   <!-- Step 2 — Edit extracted fields -->
@@ -240,6 +238,13 @@ function setText(id, msg) { const el=document.getElementById(id); if(el) el.text
 function show(id) { const el=document.getElementById(id); if(el) el.style.display=''; }
 function hide(id) { const el=document.getElementById(id); if(el) el.style.display='none'; }
 
+function openFolderPicker(folder, ev) {
+  if (ev) { ev.preventDefault(); ev.stopPropagation(); }
+  const key = folder.replace(/ /g,'_');
+  const input = document.getElementById(`fi_${key}`);
+  if (input) input.click();
+}
+
 function updateFolderCard(folder) {
   const files = folderFiles[folder] || [];
   const key = folder.replace(/ /g,'_');
@@ -284,10 +289,8 @@ function removeFolderFile(folder, idx, ev) {
 }
 
 async function doUpload() {
-  const btn = document.getElementById('btnUpload');
   const totalFiles = Object.values(folderFiles).reduce((s,f) => s+f.length, 0);
-  if (totalFiles === 0) { flash('Please upload at least one file.', 'error'); return; }
-  btn.disabled = true; btn.textContent = 'Uploading…';
+  if (totalFiles === 0) { flash('Please upload at least one file.', 'error'); return null; }
   setText('uploadStatus', 'Uploading files…');
   const fd = new FormData();
   for (const [folder, files] of Object.entries(folderFiles)) {
@@ -301,19 +304,21 @@ async function doUpload() {
     sessionId = upData.session_id;
     jobId = upData.job_id;
     setText('uploadStatus', `Uploaded ${upData.uploaded_file_count || 0} file(s).`);
-    document.getElementById('btnExtract').disabled = false;
-    flash('Files uploaded successfully. Extract when ready.', 'success');
+    flash('Files attached successfully.', 'success');
+    return upData;
   } catch(e) {
     flash(e.message || 'Upload failed', 'error');
     setText('uploadStatus', 'Upload failed');
-  } finally {
-    btn.disabled = false; btn.textContent = 'Upload Files';
+    return null;
   }
 }
 
 async function startExtraction() {
-  if (!sessionId || !jobId) { flash('Please upload files first.', 'error'); return; }
   const btn = document.getElementById('btnExtract');
+  if (!sessionId || !jobId) {
+    const uploaded = await doUpload();
+    if (!uploaded) return;
+  }
   btn.disabled = true; btn.textContent = 'Starting…';
   try {
     const res = await fetch('/extract', {
@@ -324,7 +329,7 @@ async function startExtraction() {
     const data = await res.json();
     if (!res.ok || !data.success) throw new Error(data.error_message || data.error || 'Failed to start extraction');
     setText('uploadStatus', 'Starting extraction…');
-    flash('Extraction started successfully.', 'success');
+flash('Extraction started successfully.', 'success');
     startPolling();
   } catch (e) {
     btn.disabled = false; btn.textContent = 'Extract';
@@ -356,7 +361,7 @@ async function checkExtractionStatus() {
       setText('uploadStatus', 'Extraction complete — review fields below.');
       document.getElementById('btnExtract').textContent = 'Extract';
       await loadExtractedData();
-      flash('Extraction complete — 1 token used.', 'success');
+      flash('Extraction complete — review the fields below.', 'success');
       return;
     }
     document.getElementById('btnExtract').disabled = false;
@@ -397,7 +402,7 @@ function renderFields(data) {
     div.className = 'field-group';
     div.innerHTML = `
       <label><span class="conf-dot ${dotClass}"></span>${field}${conf > 0 ? `<span class="small muted" style="float:right">${Math.round(conf*100)}%</span>` : ''}</label>
-      <input type="text" data-field="${field}" value="${String(val).replace(/"/g,'&quot;')}" placeholder="${field}"/>
+      <input type="text" data-field="${field}" value="${String(val).replace(/"/g,'&quot;')}" placeholder="${field}" autocomplete="off"/>
     `;
     grid.appendChild(div);
   });
@@ -442,7 +447,7 @@ function updateSelectedCount() {
 }
 
 async function doGenerate() {
-  if (!sessionId || !jobId) { flash('Please upload and extract first.', 'error'); return; }
+  if (!sessionId || !jobId) { flash('Please extract first.', 'error'); return; }
   const selected = getSelectedTemplates();
   if (!selected.length) { flash('Please select at least one template.', 'error'); return; }
   const btn = document.getElementById('btnGenerate');
@@ -509,6 +514,16 @@ function renderDownloads(data) {
     list.appendChild(zipBtn);
   }
 }
+
+(function initPage(){
+  const hasToken = {{ has_token|tojson }};
+  if (hasToken) {
+    document.querySelectorAll('.auth-warning').forEach(el => el.classList.add('hidden'));
+  }
+  const extractBtn = document.getElementById('btnExtract');
+  if (extractBtn) extractBtn.disabled = false;
+})();
+
 </script>
 </body>
 </html>

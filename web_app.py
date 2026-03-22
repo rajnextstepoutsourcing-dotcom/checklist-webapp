@@ -1447,7 +1447,7 @@ def _dispatcher_loop():
             _dispatcher_cycle()
         except Exception:
             app.logger.exception('[Checklist] dispatcher loop error')
-        time.sleep(CHECKLIST_DISPATCH_POLL_SECONDS)
+        time.sleep(CHECKLIST_DISPATCH_POLL_SECONDS if CHECKLIST_DISPATCH_POLL_SECONDS > 1 else 2)
 
 
 def _ensure_dispatcher_started():
@@ -1475,7 +1475,7 @@ def _start_bg_worker():
 def index():
     token = _get_ns_token(request)
     ctx = _get_ctx()
-    response = render_template('index.html', folders=DOCUMENT_FOLDERS, templates=list_templates(), fields=STANDARD_FIELDS, auth_required=not bool(ctx), dashboard_url=APP_DASHBOARD_URL, login_url=APP_LOGIN_URL, download_ttl_minutes=DOWNLOAD_TTL_MINUTES)
+    response = render_template('index.html', folders=DOCUMENT_FOLDERS, templates=list_templates(), fields=STANDARD_FIELDS, auth_required=(not bool(ctx) and not bool(token)), dashboard_url=APP_DASHBOARD_URL, login_url=APP_LOGIN_URL, download_ttl_minutes=DOWNLOAD_TTL_MINUTES, has_token=bool(token))
     from flask import make_response
     resp = make_response(response)
     if token and ctx:
