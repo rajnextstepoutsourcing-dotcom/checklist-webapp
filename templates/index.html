@@ -130,13 +130,13 @@
       <span class="brand-sep">|</span>
       <span class="brand-tool">Compliance Checklist</span>
     </div>
-    <a href="https://nextstep.co.uk/dashboard" class="btn-back">← Dashboard</a>
+    <a href="{{ dashboard_url }}" class="btn-back">← Dashboard</a>
   </div>
 
   {% if auth_required %}
   <div class="auth-warning">
     <span>⚠</span>
-    <span>You must be logged in to use this tool. <a href="https://nextstep.co.uk/login">Log in here</a></span>
+    <span>You must be logged in to use this tool. <a href="{{ login_url }}">Log in here</a></span>
   </div>
   {% endif %}
 
@@ -145,14 +145,14 @@
     <span id="tokenCount" class="token-count">—</span>
   </div>
 
-  <p class="muted" style="margin-bottom:8px;">Upload candidate documents → Queue AI extraction → Edit if needed → Select templates → Generate filled checklists</p>
+  <p class="muted" style="margin-bottom:8px;">Upload candidate documents → Extract fields → Edit if needed → Select templates → Generate filled checklists</p>
 
   <div id="flashWrap"></div>
 
   <!-- Step 1 — Upload -->
   <section class="card">
     <h2>Step 1 — Upload documents</h2>
-    <p class="muted small" style="margin-bottom:12px;">Upload files into each relevant folder. AI will extract candidate data automatically.</p>
+    <p class="muted small" style="margin-bottom:12px;">Upload files into each relevant folder. Candidate data will be extracted automatically.</p>
     <div class="folder-grid" id="folderGrid">
       {% for folder in folders %}
       <div class="folder-card" id="fc_{{ folder.replace(' ','_') }}" onclick="document.getElementById('fi_{{ folder.replace(' ','_') }}').click()">
@@ -167,7 +167,7 @@
     <div class="row">
       <button id="btnUpload" class="primary" onclick="doUpload()">Upload Files</button>
       <span id="uploadStatus" class="muted"></span>
-      <button id="btnExtract" class="ghost" onclick="startExtraction()" disabled>Queue Extraction</button>
+      <button id="btnExtract" class="ghost" onclick="startExtraction()" disabled>Extract</button>
     </div>
     <div class="token-info">ℹ Successful extraction uses <strong>1 token</strong>. Missing some fields is still valid if usable data is extracted.</div>
   </section>
@@ -175,7 +175,7 @@
   <!-- Step 2 — Edit extracted fields -->
   <section class="card" id="extractSection" style="display:none;">
     <h2>Step 2 — Review &amp; edit extracted fields</h2>
-    <p class="muted small" style="margin-bottom:12px;">AI-extracted values are shown below. Edit any field before generating.</p>
+    <p class="muted small" style="margin-bottom:12px;">Extracted values are shown below. Edit any field before generating.</p>
     <div class="fields-grid" id="fieldsGrid"></div>
   </section>
 
@@ -199,7 +199,7 @@
       <button id="btnGenerate" class="primary" onclick="doGenerate()">Generate Selected Checklists</button>
       <span id="generateStatus" class="muted"></span>
     </div>
-    <div class="token-info">ℹ First download of each generated checklist file costs <strong>1 token</strong>. Re-download in the same session is free.</div>
+    <div class="token-info">ℹ First download of each generated checklist file costs <strong>1 token</strong>. Re-download in the same session is free. Files are deleted {{ download_ttl_minutes }} minutes after download.</div>
   </section>
 
   <!-- Step 4 — Downloads -->
@@ -262,7 +262,7 @@ async function doUpload() {
     jobId = upData.job_id;
     setText('uploadStatus', `Uploaded ${upData.uploaded_file_count || 0} file(s).`);
     document.getElementById('btnExtract').disabled = false;
-    flash('Files uploaded successfully. Queue extraction when ready.', 'success');
+    flash('Files uploaded successfully. Extract when ready.', 'success');
   } catch(e) {
     flash(e.message || 'Upload failed', 'error');
     setText('uploadStatus', 'Upload failed');
@@ -274,7 +274,7 @@ async function doUpload() {
 async function startExtraction() {
   if (!sessionId || !jobId) { flash('Please upload files first.', 'error'); return; }
   const btn = document.getElementById('btnExtract');
-  btn.disabled = true; btn.textContent = 'Queued…';
+  btn.disabled = true; btn.textContent = 'Starting…';
   try {
     const res = await fetch('/extract', {
       method: 'POST',
@@ -282,13 +282,13 @@ async function startExtraction() {
       body: JSON.stringify({ job_id: jobId, session_id: sessionId })
     });
     const data = await res.json();
-    if (!res.ok || !data.success) throw new Error(data.error_message || data.error || 'Failed to queue extraction');
-    setText('uploadStatus', 'Extraction queued…');
-    flash('Extraction queued successfully.', 'success');
+    if (!res.ok || !data.success) throw new Error(data.error_message || data.error || 'Failed to start extraction');
+    setText('uploadStatus', 'Starting extraction…');
+    flash('Extraction started successfully.', 'success');
     startPolling();
   } catch (e) {
-    btn.disabled = false; btn.textContent = 'Queue Extraction';
-    flash(e.message || 'Failed to queue extraction', 'error');
+    btn.disabled = false; btn.textContent = 'Extract';
+    flash(e.message || 'Failed to start extraction', 'error');
   }
 }
 
@@ -308,25 +308,25 @@ async function checkExtractionStatus() {
     const data = await res.json();
     if (data.status === 'extract_queued' || data.status === 'extract_running') {
       setText('uploadStatus', data.current_step || data.status);
-      document.getElementById('btnExtract').textContent = data.status === 'extract_queued' ? 'Queued…' : 'Extracting…';
+      document.getElementById('btnExtract').textContent = 'Extracting…';
       return;
     }
     stopPolling();
     if (data.status === 'extract_completed') {
       setText('uploadStatus', 'Extraction complete — review fields below.');
-      document.getElementById('btnExtract').textContent = 'Queue Extraction';
+      document.getElementById('btnExtract').textContent = 'Extract';
       await loadExtractedData();
       flash('Extraction complete — 1 token used.', 'success');
       return;
     }
     document.getElementById('btnExtract').disabled = false;
-    document.getElementById('btnExtract').textContent = 'Queue Extraction';
+    document.getElementById('btnExtract').textContent = 'Extract';
     setText('uploadStatus', data.error_message || 'Extraction failed');
     flash(data.error_message || 'Extraction failed', 'error');
   } catch (e) {
     stopPolling();
     document.getElementById('btnExtract').disabled = false;
-    document.getElementById('btnExtract').textContent = 'Queue Extraction';
+    document.getElementById('btnExtract').textContent = 'Extract';
     flash(e.message || 'Status check failed', 'error');
   }
 }

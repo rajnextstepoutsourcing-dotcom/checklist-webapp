@@ -20,6 +20,11 @@ import random
 import threading
 import logging
 
+try:
+    import requests
+except Exception:
+    requests = None
+
 from flask import Flask, render_template, request, jsonify, send_file, session, abort
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
@@ -116,24 +121,61 @@ def _handle_unexpected_error(e: Exception):
 
 CORS(app)
 
+@app.after_request
+def _persist_ns_token(response):
+    token = request.args.get('ns_token') or request.headers.get('X-NextStep-Token')
+    if token:
+        response.set_cookie('ns_token', token, httponly=True, samesite='Lax', secure=True, max_age=60 * 60 * 8, path='/')
+    return response
+
 # ── NextStep Auth ─────────────────────────────────────────────────────────────
-import os as _os
+BACKEND_BASE_URL = 'https://nextstep-backend-e75l.onrender.com'
+BACKEND_VALIDATE_URL = f'{BACKEND_BASE_URL}/api/validate-session'
+APP_DASHBOARD_URL = f'{BACKEND_BASE_URL}/dashboard'
+APP_LOGIN_URL = f'{BACKEND_BASE_URL}/login'
 
 def _get_ns_token(req):
     return (req.headers.get("X-NextStep-Token")
             or req.cookies.get("ns_token")
             or req.args.get("ns_token") or "")
 
+def _validate_via_backend(token: str):
+    if not token or requests is None:
+        return None
+    try:
+        resp = requests.get(BACKEND_VALIDATE_URL, params={"token": token}, timeout=8)
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        if not data.get('valid'):
+            return None
+        user = data.get('user') or {}
+        tenant = data.get('tenant') or {}
+        return {
+            'user_id': user.get('id'),
+            'tenant_id': tenant.get('id'),
+            'role': user.get('role', 'admin'),
+            'name': user.get('name'),
+            'tenant_name': tenant.get('name'),
+            'plan_name': tenant.get('plan_name') or '',
+        }
+    except Exception as e:
+        app.logger.warning('[Auth backend] %s', e)
+        return None
+
 def _get_ctx():
     """Returns user context dict or None. Used in every route."""
     token = _get_ns_token(request)
     if not token:
         return None
+    ctx = _validate_via_backend(token)
+    if ctx:
+        return ctx
     try:
         import db
         return db.validate_user_token(token)
     except Exception as e:
-        app.logger.warning("[Auth] %s", e)
+        app.logger.warning("[Auth db] %s", e)
         return None
 
 def _require_auth():
@@ -141,7 +183,7 @@ def _require_auth():
     from flask import abort
     ctx = _get_ctx()
     if not ctx:
-        abort(401, "Not authenticated. Please log in at nextstep.co.uk")
+        abort(401, f"Not authenticated. Please log in at {APP_LOGIN_URL}")
     return ctx
 
 # ===== Folder Configuration =====
@@ -312,8 +354,9 @@ def extract_print_date_from_text(text: str) -> str:
 
 # --- Session cleanup (privacy + storage) ---
 CLEANUP_AFTER_HOURS = int(os.getenv("CLEANUP_AFTER_HOURS", "24"))
-
-CLEANUP_AFTER_HOURS = 2  # shorter cleanup for /tmp
+DOWNLOAD_TTL_MINUTES = int(os.getenv('DOWNLOAD_TTL_MINUTES', '15'))
+CHECKLIST_DISPATCH_POLL_SECONDS = float(os.getenv('CHECKLIST_DISPATCH_POLL_SECONDS', '2'))
+CHECKLIST_STALE_MINUTES = int(os.getenv('CHECKLIST_STALE_MINUTES', '20'))
 
 def cleanup_old_sessions() -> None:
     """Delete upload/output session folders older than CLEANUP_AFTER_HOURS."""
@@ -1311,6 +1354,49 @@ def _read_json(path: Path) -> dict:
     return json.loads(path.read_text(encoding='utf-8'))
 
 
+
+def _cleanup_downloaded_outputs():
+    import db
+    ttl_seconds = max(60, DOWNLOAD_TTL_MINUTES * 60)
+    now = _dt.datetime.utcnow()
+    outputs = []
+    try:
+        session = db.get_session()
+        if not session:
+            return
+        try:
+            rows = session.execute(__import__('sqlalchemy').text("SELECT output_id, output_path, session_id, tenant_id, user_id, first_downloaded_at, last_downloaded_at FROM checklist_outputs WHERE first_downloaded_at IS NOT NULL")).mappings().all()
+            outputs = [dict(r) for r in rows]
+        finally:
+            session.close()
+    except Exception:
+        return
+    for out in outputs:
+        ts = out.get('last_downloaded_at') or out.get('first_downloaded_at')
+        if not ts:
+            continue
+        try:
+            if isinstance(ts, str):
+                ts_dt = _dt.datetime.fromisoformat(ts.replace('Z', '+00:00').replace(' ', 'T'))
+                if ts_dt.tzinfo is not None:
+                    ts_dt = ts_dt.astimezone(_dt.timezone.utc).replace(tzinfo=None)
+            else:
+                ts_dt = ts
+        except Exception:
+            continue
+        if (now - ts_dt).total_seconds() < ttl_seconds:
+            continue
+        try:
+            fp = Path(out['output_path'])
+            if fp.exists():
+                fp.unlink(missing_ok=True)
+            # remove zip too if exists in same session folder
+            zf = fp.parent / _build_zip_filename((_read_json(_reviewed_json_path(out['tenant_id'], out['user_id'], out['session_id'])) or {}).get('Candidate Name') or 'Candidate')
+            if zf.exists():
+                zf.unlink(missing_ok=True)
+        except Exception:
+            pass
+
 def _run_checklist_extraction(job: dict):
     import db
     tenant_id = int(job['tenant_id']); user_id = int(job['user_id'])
@@ -1359,7 +1445,7 @@ def _dispatcher_loop():
             _dispatcher_cycle()
         except Exception:
             app.logger.exception('[Checklist] dispatcher loop error')
-        time.sleep(2)
+        time.sleep(CHECKLIST_DISPATCH_POLL_SECONDS)
 
 
 def _ensure_dispatcher_started():
@@ -1385,8 +1471,14 @@ def _start_bg_worker():
 
 @app.route('/')
 def index():
+    token = _get_ns_token(request)
     ctx = _get_ctx()
-    return render_template('index.html', folders=DOCUMENT_FOLDERS, templates=list_templates(), fields=STANDARD_FIELDS, auth_required=not bool(ctx))
+    response = render_template('index.html', folders=DOCUMENT_FOLDERS, templates=list_templates(), fields=STANDARD_FIELDS, auth_required=not bool(ctx), dashboard_url=APP_DASHBOARD_URL, login_url=APP_LOGIN_URL, download_ttl_minutes=DOWNLOAD_TTL_MINUTES)
+    from flask import make_response
+    resp = make_response(response)
+    if token and ctx:
+        resp.set_cookie('ns_token', token, httponly=True, samesite='Lax', secure=True, max_age=60 * 60 * 8, path='/')
+    return resp
 
 
 @app.route('/templates', methods=['GET'])
