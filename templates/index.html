@@ -161,7 +161,7 @@
     <p class="muted small" style="margin-bottom:12px;">Upload files into each relevant folder. Candidate data will be extracted automatically.</p>
     <div class="folder-grid" id="folderGrid">
       {% for folder in folders %}
-      <label class="folder-card" id="fc_{{ folder.replace(' ','_') }}" for="fi_{{ folder.replace(' ','_') }}" data-folder="{{ folder }}">
+      <div class="folder-card" id="fc_{{ folder.replace(' ','_') }}" data-folder="{{ folder }}" role="button" tabindex="0">
         <input type="file" id="fi_{{ folder.replace(' ','_') }}" class="folder-input" multiple
                accept=".pdf,.png,.jpg,.jpeg,.docx,.txt"
                data-folder="{{ folder }}" onchange="onFolderFiles(this)"/>
@@ -169,7 +169,7 @@
         <div class="folder-count" id="fcount_{{ folder.replace(' ','_') }}">No files</div>
         <div class="folder-files" id="flist_{{ folder.replace(' ','_') }}"></div>
         <div class="folder-note">{{ 'No limit' if folder == 'TRAININGS' else 'Max 5 files' }}</div>
-      </label>
+      </div>
       {% endfor %}
     </div>
     <div class="row">
@@ -211,6 +211,7 @@
   <section class="card" id="downloadSection" style="display:none;">
     <h2>Step 4 — Download</h2>
     <div class="download-list" id="downloadList"></div>
+    <iframe id="downloadFrame" name="downloadFrame" style="display:none"></iframe>
   </section>
 
 </div>
@@ -237,27 +238,51 @@ function setText(id, msg) { const el=document.getElementById(id); if(el) el.text
 function show(id) { const el=document.getElementById(id); if(el) el.style.display=''; }
 function hide(id) { const el=document.getElementById(id); if(el) el.style.display='none'; }
 
-function openFolderPicker(folder, ev) {
-  if (ev) { ev.preventDefault(); }
-  const key = folder.replace(/ /g,'_');
-  const input = document.getElementById(`fi_${key}`);
-  if (input) input.click();
-}
-
 function bindFolderCards() {
   document.querySelectorAll('.folder-card[data-folder]').forEach(card => {
-    card.addEventListener('click', (ev) => {
-      if (ev.target.closest('.folder-file-remove')) {
+    if (card.dataset.bound === '1') return;
+    card.dataset.bound = '1';
+    const openPicker = (ev) => {
+      if (ev) {
+        if (ev.target.closest('.folder-file-remove')) {
+          ev.preventDefault();
+          ev.stopPropagation();
+          return;
+        }
+        if (ev.type === 'keydown' && ev.key !== 'Enter' && ev.key !== ' ') {
+          return;
+        }
         ev.preventDefault();
-        ev.stopPropagation();
-        return;
       }
       const folder = card.dataset.folder;
       const key = folder.replace(/ /g,'_');
       const input = document.getElementById(`fi_${key}`);
       if (input) input.click();
-    });
+    };
+    card.addEventListener('click', openPicker);
+    card.addEventListener('keydown', openPicker);
   });
+}
+
+async function backgroundDownload(url, filename) {
+  const res = await fetch(url, { credentials: 'same-origin' });
+  if (!res.ok) {
+    let msg = 'Download failed';
+    try {
+      const data = await res.json();
+      msg = data.error_message || data.error || msg;
+    } catch (_) {}
+    throw new Error(msg);
+  }
+  const blob = await res.blob();
+  const objectUrl = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = objectUrl;
+  if (filename) a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(objectUrl), 1500);
 }
 
 function updateFolderCard(folder) {
@@ -515,17 +540,36 @@ function renderDownloads(data) {
   (data.files || []).forEach(f => {
     const div = document.createElement('div');
     div.className = 'download-item';
-    div.innerHTML = `
-      <span class="fname">📄 ${f.filename}</span>
-      <a href="${f.download_url}" download="${f.filename}">⬇ Download</a>
-    `;
+    const name = document.createElement('span');
+    name.className = 'fname';
+    name.textContent = `📄 ${f.filename}`;
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'ghost';
+    btn.textContent = '⬇ Download';
+    btn.onclick = async () => {
+      try {
+        await backgroundDownload(f.download_url, f.filename);
+      } catch (e) {
+        flash(e.message || 'Download failed', 'error');
+      }
+    };
+    div.appendChild(name);
+    div.appendChild(btn);
     list.appendChild(div);
   });
   if (data.zip && data.zip.download_url) {
     const zipBtn = document.createElement('button');
+    zipBtn.type = 'button';
     zipBtn.className = 'primary zip-btn';
     zipBtn.textContent = '⬇ Download All (ZIP)';
-    zipBtn.onclick = () => { window.location.href = data.zip.download_url; };
+    zipBtn.onclick = async () => {
+      try {
+        await backgroundDownload(data.zip.download_url, data.zip.filename || 'checklists.zip');
+      } catch (e) {
+        flash(e.message || 'ZIP download failed', 'error');
+      }
+    };
     list.appendChild(zipBtn);
   }
 }

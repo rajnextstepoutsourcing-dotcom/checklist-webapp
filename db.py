@@ -520,15 +520,15 @@ def save_output_rows(*, job_id: str, session_id: str, tenant_id: int, user_id: i
             existing = session.execute(text("SELECT output_id FROM checklist_outputs WHERE session_id = :session_id AND tenant_id = :tenant_id AND user_id = :user_id AND template_key = :template_key ORDER BY generated_at DESC LIMIT 1"),
                                        {'session_id': session_id, 'tenant_id': tenant_id, 'user_id': user_id, 'template_key': out.get('template_key')}).mappings().first()
             if existing:
-                session.execute(text("UPDATE checklist_outputs SET job_id = :job_id, template_name = :template_name, output_filename = :output_filename, output_path = :output_path, is_generated = 1, generated_at = :generated_at WHERE output_id = :output_id"),
-                                {'job_id': job_id, 'template_name': out.get('template_name'), 'output_filename': out.get('output_filename'), 'output_path': out.get('output_path'), 'generated_at': datetime.utcnow(), 'output_id': existing['output_id']})
+                session.execute(text("UPDATE checklist_outputs SET job_id = :job_id, template_name = :template_name, output_filename = :output_filename, output_path = :output_path, is_generated = :is_generated, generated_at = :generated_at WHERE output_id = :output_id"),
+                                {'job_id': job_id, 'template_name': out.get('template_name'), 'output_filename': out.get('output_filename'), 'output_path': out.get('output_path'), 'is_generated': True, 'generated_at': datetime.utcnow(), 'output_id': existing['output_id']})
             else:
                 session.execute(text("INSERT INTO checklist_outputs (output_id, job_id, session_id, tenant_id, user_id, template_key, template_name, output_filename, output_path, is_generated, generated_at, download_token_charged, download_count) VALUES (:output_id, :job_id, :session_id, :tenant_id, :user_id, :template_key, :template_name, :output_filename, :output_path, :is_generated, :generated_at, :download_token_charged, :download_count)"), {
                     'output_id': out['output_id'], 'job_id': job_id, 'session_id': session_id,
                     'tenant_id': tenant_id, 'user_id': user_id, 'template_key': out.get('template_key'),
                     'template_name': out.get('template_name'), 'output_filename': out.get('output_filename'),
-                    'output_path': out.get('output_path'), 'is_generated': 1, 'generated_at': datetime.utcnow(),
-                    'download_token_charged': 0, 'download_count': 0,
+                    'output_path': out.get('output_path'), 'is_generated': True, 'generated_at': datetime.utcnow(),
+                    'download_token_charged': False, 'download_count': 0,
                 })
         session.commit()
         return True
@@ -546,11 +546,11 @@ def mark_noncurrent_outputs_inactive(*, session_id: str, tenant_id: int, user_id
         return False
     try:
         rows = session.execute(text("SELECT output_id, template_key FROM checklist_outputs WHERE session_id = :session_id AND tenant_id = :tenant_id AND user_id = :user_id"),
-                               {'session_id': session_id, 'tenant_id': tenant_id, 'user_id': user_id}).mappings().all()
+                               {'session_id': session_id, 'tenant_id': tenant_id, 'user_id': user_id, 'is_generated': True}).mappings().all()
         active = set(active_template_keys or [])
         for row in rows:
             session.execute(text("UPDATE checklist_outputs SET is_generated = :is_generated WHERE output_id = :output_id"),
-                            {'is_generated': 1 if row.get('template_key') in active else 0, 'output_id': row['output_id']})
+                            {'is_generated': bool(row.get('template_key') in active), 'output_id': row['output_id']})
         session.commit()
         return True
     except Exception as e:
@@ -566,8 +566,8 @@ def list_outputs(session_id: str, tenant_id: int, user_id: int) -> List[Dict[str
     if not session:
         return []
     try:
-        rows = session.execute(text("SELECT * FROM checklist_outputs WHERE session_id = :session_id AND tenant_id = :tenant_id AND user_id = :user_id AND is_generated = 1 ORDER BY generated_at ASC"),
-                              {'session_id': session_id, 'tenant_id': tenant_id, 'user_id': user_id}).mappings().all()
+        rows = session.execute(text("SELECT * FROM checklist_outputs WHERE session_id = :session_id AND tenant_id = :tenant_id AND user_id = :user_id AND is_generated = :is_generated ORDER BY generated_at ASC"),
+                              {'session_id': session_id, 'tenant_id': tenant_id, 'user_id': user_id, 'is_generated': True}).mappings().all()
         return [dict(r) for r in rows]
     except Exception as e:
         log.error('[DB] list_outputs error: %s', e)
@@ -599,13 +599,13 @@ def mark_output_downloaded(output_id: str, tenant_id: int, user_id: int, charge_
         if charge_now:
             session.execute(text("""
                 UPDATE checklist_outputs
-                SET download_token_charged = 1,
+                SET download_token_charged = :download_token_charged,
                     download_token_charge_id = :charge_id,
                     first_downloaded_at = COALESCE(first_downloaded_at, :now),
                     last_downloaded_at = :now,
                     download_count = COALESCE(download_count, 0) + 1
                 WHERE output_id = :output_id AND tenant_id = :tenant_id AND user_id = :user_id
-            """), {'output_id': output_id, 'tenant_id': tenant_id, 'user_id': user_id, 'charge_id': charge_usage_id, 'now': datetime.utcnow()})
+            """), {'output_id': output_id, 'tenant_id': tenant_id, 'user_id': user_id, 'charge_id': charge_usage_id, 'download_token_charged': True, 'now': datetime.utcnow()})
         else:
             session.execute(text("""
                 UPDATE checklist_outputs
@@ -632,20 +632,20 @@ def mark_multiple_outputs_downloaded(session_id: str, tenant_id: int, user_id: i
         if output_ids_to_charge:
             session.execute(text("""
                 UPDATE checklist_outputs
-                SET download_token_charged = 1,
+                SET download_token_charged = :download_token_charged,
                     download_token_charge_id = :charge_id,
                     first_downloaded_at = COALESCE(first_downloaded_at, :now),
                     last_downloaded_at = :now,
                     download_count = COALESCE(download_count, 0) + 1
                 WHERE session_id = :session_id AND tenant_id = :tenant_id AND user_id = :user_id
                   AND output_id IN :output_ids
-            """).bindparams(text('')), {'charge_id': charge_usage_id, 'now': now, 'session_id': session_id, 'tenant_id': tenant_id, 'user_id': user_id, 'output_ids': tuple(output_ids_to_charge)})
+            """).bindparams(text('')), {'charge_id': charge_usage_id, 'download_token_charged': True, 'now': now, 'session_id': session_id, 'tenant_id': tenant_id, 'user_id': user_id, 'output_ids': tuple(output_ids_to_charge)})
         session.execute(text("""
             UPDATE checklist_outputs
             SET last_downloaded_at = :now,
                 download_count = COALESCE(download_count, 0) + 1
-            WHERE session_id = :session_id AND tenant_id = :tenant_id AND user_id = :user_id AND is_generated = 1
-        """), {'now': now, 'session_id': session_id, 'tenant_id': tenant_id, 'user_id': user_id})
+            WHERE session_id = :session_id AND tenant_id = :tenant_id AND user_id = :user_id AND is_generated = :is_generated
+        """), {'now': now, 'session_id': session_id, 'tenant_id': tenant_id, 'user_id': user_id, 'is_generated': True})
         session.commit()
         return True
     except Exception:
@@ -657,8 +657,8 @@ def mark_multiple_outputs_downloaded(session_id: str, tenant_id: int, user_id: i
             for out in outs:
                 charge = out['output_id'] in set(output_ids_to_charge)
                 if charge:
-                    session.execute(text("UPDATE checklist_outputs SET download_token_charged = 1, download_token_charge_id = :charge_id, first_downloaded_at = COALESCE(first_downloaded_at, :now), last_downloaded_at = :now, download_count = COALESCE(download_count,0)+1 WHERE output_id=:output_id AND tenant_id=:tenant_id AND user_id=:user_id"),
-                                    {'charge_id': charge_usage_id, 'now': datetime.utcnow(), 'output_id': out['output_id'], 'tenant_id': tenant_id, 'user_id': user_id})
+                    session.execute(text("UPDATE checklist_outputs SET download_token_charged = :download_token_charged, download_token_charge_id = :charge_id, first_downloaded_at = COALESCE(first_downloaded_at, :now), last_downloaded_at = :now, download_count = COALESCE(download_count,0)+1 WHERE output_id=:output_id AND tenant_id=:tenant_id AND user_id=:user_id"),
+                                    {'charge_id': charge_usage_id, 'download_token_charged': True, 'now': datetime.utcnow(), 'output_id': out['output_id'], 'tenant_id': tenant_id, 'user_id': user_id})
                 else:
                     session.execute(text("UPDATE checklist_outputs SET last_downloaded_at = :now, download_count = COALESCE(download_count,0)+1 WHERE output_id=:output_id AND tenant_id=:tenant_id AND user_id=:user_id"),
                                     {'now': datetime.utcnow(), 'output_id': out['output_id'], 'tenant_id': tenant_id, 'user_id': user_id})
