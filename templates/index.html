@@ -239,29 +239,7 @@ function show(id) { const el=document.getElementById(id); if(el) el.style.displa
 function hide(id) { const el=document.getElementById(id); if(el) el.style.display='none'; }
 
 function bindFolderCards() {
-  document.querySelectorAll('.folder-card[data-folder]').forEach(card => {
-    if (card.dataset.bound === '1') return;
-    card.dataset.bound = '1';
-    const openPicker = (ev) => {
-      if (ev) {
-        if (ev.target.closest('.folder-file-remove')) {
-          ev.preventDefault();
-          ev.stopPropagation();
-          return;
-        }
-        if (ev.type === 'keydown' && ev.key !== 'Enter' && ev.key !== ' ') {
-          return;
-        }
-        ev.preventDefault();
-      }
-      const folder = card.dataset.folder;
-      const key = folder.replace(/ /g,'_');
-      const input = document.getElementById(`fi_${key}`);
-      if (input) input.click();
-    };
-    card.addEventListener('click', openPicker);
-    card.addEventListener('keydown', openPicker);
-  });
+  // Native full-card input overlay handles opening the picker exactly once.
 }
 
 async function backgroundDownload(url, filename) {
