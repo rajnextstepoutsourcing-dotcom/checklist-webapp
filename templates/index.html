@@ -161,7 +161,7 @@
     <p class="muted small" style="margin-bottom:12px;">Upload files into each relevant folder. Candidate data will be extracted automatically.</p>
     <div class="folder-grid" id="folderGrid">
       {% for folder in folders %}
-      <div class="folder-card" id="fc_{{ folder.replace(' ','_') }}" onclick="openFolderPicker('{{ folder }}', event)">
+      <label class="folder-card" id="fc_{{ folder.replace(' ','_') }}" for="fi_{{ folder.replace(' ','_') }}" data-folder="{{ folder }}">
         <input type="file" id="fi_{{ folder.replace(' ','_') }}" class="folder-input" multiple
                accept=".pdf,.png,.jpg,.jpeg,.docx,.txt"
                data-folder="{{ folder }}" onchange="onFolderFiles(this)"/>
@@ -169,7 +169,7 @@
         <div class="folder-count" id="fcount_{{ folder.replace(' ','_') }}">No files</div>
         <div class="folder-files" id="flist_{{ folder.replace(' ','_') }}"></div>
         <div class="folder-note">{{ 'No limit' if folder == 'TRAININGS' else 'Max 5 files' }}</div>
-      </div>
+      </label>
       {% endfor %}
     </div>
     <div class="row">
@@ -205,7 +205,6 @@
       <button id="btnGenerate" class="primary" onclick="doGenerate()">Generate Selected Checklists</button>
       <span id="generateStatus" class="muted"></span>
     </div>
-    <div class="token-info">ℹ First download of each generated checklist file costs <strong>1 token</strong>. Re-download in the same session is free. Files are deleted {{ download_ttl_minutes }} minutes after download.</div>
   </section>
 
   <!-- Step 4 — Downloads -->
@@ -239,10 +238,26 @@ function show(id) { const el=document.getElementById(id); if(el) el.style.displa
 function hide(id) { const el=document.getElementById(id); if(el) el.style.display='none'; }
 
 function openFolderPicker(folder, ev) {
-  if (ev) { ev.preventDefault(); ev.stopPropagation(); }
+  if (ev) { ev.preventDefault(); }
   const key = folder.replace(/ /g,'_');
   const input = document.getElementById(`fi_${key}`);
   if (input) input.click();
+}
+
+function bindFolderCards() {
+  document.querySelectorAll('.folder-card[data-folder]').forEach(card => {
+    card.addEventListener('click', (ev) => {
+      if (ev.target.closest('.folder-file-remove')) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        return;
+      }
+      const folder = card.dataset.folder;
+      const key = folder.replace(/ /g,'_');
+      const input = document.getElementById(`fi_${key}`);
+      if (input) input.click();
+    });
+  });
 }
 
 function updateFolderCard(folder) {
@@ -516,6 +531,7 @@ function renderDownloads(data) {
 }
 
 (function initPage(){
+  bindFolderCards();
   const hasToken = {{ has_token|tojson }};
   if (hasToken) {
     document.querySelectorAll('.auth-warning').forEach(el => el.classList.add('hidden'));
