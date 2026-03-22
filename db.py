@@ -517,25 +517,45 @@ def save_output_rows(*, job_id: str, session_id: str, tenant_id: int, user_id: i
         return False
     try:
         for out in outputs:
-            session.execute(text("""
-                INSERT INTO checklist_outputs (output_id, job_id, session_id, tenant_id, user_id,
-                                               template_key, template_name, output_filename, output_path,
-                                               is_generated, generated_at, download_token_charged, download_count)
-                VALUES (:output_id, :job_id, :session_id, :tenant_id, :user_id,
-                        :template_key, :template_name, :output_filename, :output_path,
-                        :is_generated, :generated_at, :download_token_charged, :download_count)
-            """), {
-                'output_id': out['output_id'], 'job_id': job_id, 'session_id': session_id,
-                'tenant_id': tenant_id, 'user_id': user_id, 'template_key': out.get('template_key'),
-                'template_name': out.get('template_name'), 'output_filename': out.get('output_filename'),
-                'output_path': out.get('output_path'), 'is_generated': 1, 'generated_at': datetime.utcnow(),
-                'download_token_charged': 0, 'download_count': 0,
-            })
+            existing = session.execute(text("SELECT output_id FROM checklist_outputs WHERE session_id = :session_id AND tenant_id = :tenant_id AND user_id = :user_id AND template_key = :template_key ORDER BY generated_at DESC LIMIT 1"),
+                                       {'session_id': session_id, 'tenant_id': tenant_id, 'user_id': user_id, 'template_key': out.get('template_key')}).mappings().first()
+            if existing:
+                session.execute(text("UPDATE checklist_outputs SET job_id = :job_id, template_name = :template_name, output_filename = :output_filename, output_path = :output_path, is_generated = 1, generated_at = :generated_at WHERE output_id = :output_id"),
+                                {'job_id': job_id, 'template_name': out.get('template_name'), 'output_filename': out.get('output_filename'), 'output_path': out.get('output_path'), 'generated_at': datetime.utcnow(), 'output_id': existing['output_id']})
+            else:
+                session.execute(text("INSERT INTO checklist_outputs (output_id, job_id, session_id, tenant_id, user_id, template_key, template_name, output_filename, output_path, is_generated, generated_at, download_token_charged, download_count) VALUES (:output_id, :job_id, :session_id, :tenant_id, :user_id, :template_key, :template_name, :output_filename, :output_path, :is_generated, :generated_at, :download_token_charged, :download_count)"), {
+                    'output_id': out['output_id'], 'job_id': job_id, 'session_id': session_id,
+                    'tenant_id': tenant_id, 'user_id': user_id, 'template_key': out.get('template_key'),
+                    'template_name': out.get('template_name'), 'output_filename': out.get('output_filename'),
+                    'output_path': out.get('output_path'), 'is_generated': 1, 'generated_at': datetime.utcnow(),
+                    'download_token_charged': 0, 'download_count': 0,
+                })
         session.commit()
         return True
     except Exception as e:
         session.rollback()
         log.error('[DB] save_output_rows error: %s', e)
+        return False
+    finally:
+        session.close()
+
+
+def mark_noncurrent_outputs_inactive(*, session_id: str, tenant_id: int, user_id: int, active_template_keys: List[str]) -> bool:
+    session = get_session()
+    if not session:
+        return False
+    try:
+        rows = session.execute(text("SELECT output_id, template_key FROM checklist_outputs WHERE session_id = :session_id AND tenant_id = :tenant_id AND user_id = :user_id"),
+                               {'session_id': session_id, 'tenant_id': tenant_id, 'user_id': user_id}).mappings().all()
+        active = set(active_template_keys or [])
+        for row in rows:
+            session.execute(text("UPDATE checklist_outputs SET is_generated = :is_generated WHERE output_id = :output_id"),
+                            {'is_generated': 1 if row.get('template_key') in active else 0, 'output_id': row['output_id']})
+        session.commit()
+        return True
+    except Exception as e:
+        session.rollback()
+        log.error('[DB] mark_noncurrent_outputs_inactive error: %s', e)
         return False
     finally:
         session.close()

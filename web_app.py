@@ -246,7 +246,8 @@ DOCUMENT_FOLDERS = [
     "POA",
     "PASSPORT",
     "RTW",
-    "TRAININGS"
+    "TRAININGS",
+    "IMAGE"
 ]
 
 TEMPLATE_METADATA = [
@@ -265,7 +266,8 @@ STANDARD_FIELDS = [
     "Address", "Phone", "DOB", "Nationality", "NI Number",
     "Role", "NMC PIN", "DBS Number", "DBS Issue Date",
     "DBS Last Checked Date", "Training Date", "Training Expiry Date",
-    "RTW Status", "Visa Expiry Date", "Visa Type", "Restriction", "Share Code"
+    "RTW Status", "Visa Expiry Date", "Visa Type", "Restriction", "Share Code",
+    "Form Completed By", "Signature", "Position"
 ]
 
 # Field extraction priority mapping
@@ -1502,14 +1504,29 @@ def upload_files():
             folder_path = session_folder / folder_name
             folder_path.mkdir(parents=True, exist_ok=True)
             field_name = f'files_{folder_name.replace(" ", "_")}'
-            files = request.files.getlist(field_name)
+            files = [f for f in request.files.getlist(field_name) if f and (f.filename or '').strip()]
+            allowed_limit = None if folder_name == 'TRAININGS' else 5
+            if allowed_limit is not None and len(files) > allowed_limit:
+                return jsonify({'success': False, 'error_message': f'{folder_name} allows maximum {allowed_limit} files. You selected {len(files)}.'}), 400
             count = 0
-            for file in files[:5]:
-                if file and allowed_file(file.filename):
-                    filename = secure_filename(file.filename)
-                    file.save(folder_path / filename)
-                    count += 1
-                    total_files += 1
+            used_names = set()
+            for file in files:
+                if not allowed_file(file.filename):
+                    continue
+                filename = secure_filename(file.filename)
+                if not filename:
+                    continue
+                stem = Path(filename).stem
+                suffix = Path(filename).suffix
+                candidate = filename
+                n = 2
+                while candidate.lower() in used_names or (folder_path / candidate).exists():
+                    candidate = f"{stem}_{n}{suffix}"
+                    n += 1
+                used_names.add(candidate.lower())
+                file.save(folder_path / candidate)
+                count += 1
+                total_files += 1
             upload_stats[folder_name] = count
         if total_files == 0:
             return jsonify({'success': False, 'error_message': 'Please upload at least one supported file.'}), 400
@@ -1672,6 +1689,9 @@ def process_documents():
             'Right to work expiry date': flat_field_values.get('Visa Expiry Date', ''), 'Right To Work Expiry Date': flat_field_values.get('Visa Expiry Date', ''),
             'Type of visa': flat_field_values.get('Visa Type', ''), 'Restriction': flat_field_values.get('Restriction', ''),
             "Today's Date": todays, "Today's date": todays, 'YES/NA': yes_na, 'Candidate share code': flat_field_values.get('Share Code', ''),
+            'Form Completed By': flat_field_values.get('Form Completed By', ''), 'form completed by': flat_field_values.get('Form Completed By', ''),
+            'Signature': flat_field_values.get('Signature', ''), 'signature': flat_field_values.get('Signature', ''),
+            'Position': flat_field_values.get('Position', ''), 'position': flat_field_values.get('Position', ''),
         }
         for k, v in flat_field_values.items():
             replacements.setdefault(k, v or '')
@@ -1709,19 +1729,9 @@ def process_documents():
                 for fn in generated_files:
                     zipf.write(output_folder / fn, fn)
             zip_url = f'/download-zip/{session_id}'
-        # replace output rows for session by clearing existing output files table rows from DB not implemented; simple append can duplicate if repeated
-        # safer: delete old rows for session owner
-        s = db.get_session()
-        if s:
-            try:
-                s.execute(__import__('sqlalchemy').text('DELETE FROM checklist_outputs WHERE session_id = :session_id AND tenant_id = :tenant_id AND user_id = :user_id'), {'session_id': session_id, 'tenant_id': tenant_id, 'user_id': user_id})
-                s.commit()
-            except Exception:
-                s.rollback()
-            finally:
-                s.close()
         if output_rows:
             db.save_output_rows(job_id=job_id, session_id=session_id, tenant_id=tenant_id, user_id=user_id, outputs=output_rows)
+        db.mark_noncurrent_outputs_inactive(session_id=session_id, tenant_id=tenant_id, user_id=user_id, active_template_keys=selected_template_keys)
         db.update_checklist_job(job_id, tenant_id, user_id, status='generated' if output_rows else 'generation_failed', current_step='Generation completed' if output_rows else 'Generation failed', reviewed_data_path=str(reviewed_path), output_path=str(output_folder), generated_file_count=len(output_rows), generated_at=_dt.datetime.utcnow(), error_message='; '.join(errors[:20]) if errors else None)
         return jsonify({'success': bool(output_rows), 'job_id': job_id, 'session_id': session_id, 'status': 'generated' if output_rows else 'generation_failed', 'generated_file_count': len(output_rows), 'files': file_downloads, 'zip': {'filename': zip_name, 'download_url': zip_url} if zip_url else None, 'errors': errors})
     except Exception as e:
