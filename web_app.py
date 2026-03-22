@@ -84,6 +84,7 @@ except Exception:
 try:
     import docx
     from docx.document import Document as _DocxDocument
+    from docx.shared import Mm
 except Exception as e:
     raise SystemExit("Missing dependency: python-docx. Install with: pip install python-docx") from e
 
@@ -267,52 +268,127 @@ STANDARD_FIELDS = [
     "Role", "NMC PIN", "DBS Number", "DBS Issue Date",
     "DBS Last Checked Date", "Training Date", "Training Expiry Date",
     "RTW Status", "Visa Expiry Date", "Visa Type", "Restriction", "Share Code",
-    "Form Completed By", "Signature", "Position"
+    "Gender", "Employment History Summary", "Form Completed By", "Signature", "Position"
 ]
 
 # Field extraction priority mapping
 FIELD_PRIORITY = {
-    "Candidate Name": ["DBS", "APPLICATION FORM", "CV", "PASSPORT"],
-    "Title": ["APPLICATION FORM"],
-    "Forename(s)": ["DBS", "APPLICATION FORM", "CV", "PASSPORT"],
-    "Surname": ["DBS", "APPLICATION FORM", "CV", "PASSPORT"],
+    "Candidate Name": ["PASSPORT", "DBS", "APPLICATION FORM", "CV"],
+    "Title": ["APPLICATION FORM", "DBS", "PASSPORT"],
+    "Forename(s)": ["PASSPORT", "DBS", "APPLICATION FORM", "CV"],
+    "Surname": ["PASSPORT", "DBS", "APPLICATION FORM", "CV"],
     "Email": ["APPLICATION FORM", "CV"],
     "Phone": ["APPLICATION FORM", "CV"],
-    "DOB": ["DBS", "APPLICATION FORM", "PASSPORT"],
+    "DOB": ["PASSPORT", "DBS", "APPLICATION FORM"],
     "Address": ["POA", "APPLICATION FORM"],
     "Nationality": ["PASSPORT", "APPLICATION FORM"],
     "NI Number": ["NI", "APPLICATION FORM"],
-    "Role": ["AUTO"],  # Special: NMC folder check
+    "Role": ["AUTO"],
     "NMC PIN": ["NMC"],
     "DBS Number": ["DBS"],
     "DBS Issue Date": ["DBS"],
     "DBS Last Checked Date": ["DBS"],
-    "Training Date": ["TRAININGS"],  # Special: earliest in 12 months
-    "Training Expiry Date": ["CALCULATED"],  # Training Date + 12 months
+    "Training Date": ["TRAININGS"],
+    "Training Expiry Date": ["CALCULATED"],
     "RTW Status": ["RTW"],
     "Visa Expiry Date": ["RTW"],
     "Visa Type": ["RTW"],
     "Restriction": ["RTW"],
-    "Share Code": ["RTW"]
+    "Share Code": ["RTW"],
+    "Gender": ["DBS", "PASSPORT", "APPLICATION FORM"],
+    "Employment History Summary": ["CV"],
 }
 
-SENSITIVE_FIELDS = {"NI Number"}
-# --- Sensitive-field validation ---
+SENSITIVE_FIELDS = {"NI Number", "DBS Number", "NMC PIN", "Share Code"}
 NI_REGEX = re.compile(
-    r"\b(?!BG)(?!GB)(?!NK)(?!KN)(?!TN)(?!NT)(?!ZZ)"
+    r"\b(?!BG)(?!GB)(?!NK)(?!KN)(?!TN)(?!NT)(?!ZZ)(?!OO)"
     r"[A-CEGHJ-PR-TW-Z]{2}\s?\d{2}\s?\d{2}\s?\d{2}\s?[A-D]\b",
     re.IGNORECASE
 )
+DBS_REGEX = re.compile(r"\b\d{10,12}\b")
+
+VISA_TYPE_MAP = {
+    "student": "Student",
+    "sponsored": "Sponsored",
+    "skilled worker": "Skilled Worker",
+    "tier 2": "Skilled Worker",
+    "health and care": "Health and Care Worker",
+    "health care worker": "Health and Care Worker",
+    "graduate": "Graduate",
+    "dependent": "Dependent",
+    "spouse": "Spouse",
+}
+
+
+def _normalize_spaces(value: str) -> str:
+    return re.sub(r"\s+", " ", (value or "").strip())
+
+
+def normalize_ni(value: str) -> str:
+    raw = re.sub(r"[^A-Za-z0-9]", "", (value or "").upper())
+    if len(raw) < 9:
+        return ""
+    raw = raw[:9]
+    return f"{raw[0:2]} {raw[2:4]} {raw[4:6]} {raw[6:8]} {raw[8]}"
+
 
 def validate_ni(value: str) -> str:
-    v = (value or "").strip()
+    v = normalize_ni(value)
     if not v:
         return ""
-    v_up = re.sub(r"\s+", " ", v).upper()
-    v_nospace = v_up.replace(" ", "")
-    if NI_REGEX.search(v_up) or NI_REGEX.search(v_nospace):
-        return v_up
+    compact = v.replace(" ", "")
+    if NI_REGEX.search(v) or NI_REGEX.search(compact):
+        return v
     return ""
+
+
+def validate_dbs_number(value: str) -> str:
+    v = re.sub(r"[^0-9]", "", value or "")
+    m = DBS_REGEX.search(v)
+    return m.group(0) if m else ""
+
+
+def normalize_date_value(value: str) -> str:
+    value = _normalize_spaces(value)
+    if not value:
+        return ""
+    try:
+        if dateparser:
+            parsed = dateparser.parse(value, dayfirst=True, fuzzy=True)
+            if parsed:
+                return parsed.date().strftime("%d/%m/%Y")
+    except Exception:
+        pass
+    return value
+
+
+def normalize_gender(value: str) -> str:
+    v = _normalize_spaces(value).lower()
+    if v in {"male", "m"}:
+        return "Male"
+    if v in {"female", "f"}:
+        return "Female"
+    return ""
+
+
+def normalize_visa_type(value: str) -> str:
+    v = _normalize_spaces(value)
+    low = v.lower()
+    for key, mapped in VISA_TYPE_MAP.items():
+        if key in low:
+            return mapped
+    return v
+
+
+def clean_address(value: str) -> str:
+    if not value:
+        return ""
+    parts = [re.sub(r"\s+", " ", p).strip(" ,") for p in re.split(r"[\r\n]+", value) if p.strip()]
+    seen = []
+    for part in parts:
+        if part and part not in seen:
+            seen.append(part)
+    return "\n".join(seen)
 
 def extract_print_date_from_text(text: str) -> str:
     """Extract Print Date from DBS check style text and treat as issue date."""
@@ -870,24 +946,15 @@ def detect_role_from_nmc(nmc_folder: Path) -> str:
     return "HCA"
 
 def extract_training_date(trainings_folder: Path) -> Tuple[str, str, float]:
-    """Extract training date.
-
-    Rule:
-    - Find the earliest date within last 12 months across training documents.
-    - If none found, generate a random training date (last 3 months).
-    Also returns the exact source file that contained the chosen date.
-    """
+    """Return earliest valid training date within last 12 months; otherwise blank."""
     if not trainings_folder.exists():
-        return generate_random_training_date()
+        return "", "TRAININGS (no files)", 0.0
 
-    # Parse per-file so we can report correct source
     date_pattern = re.compile(r'\b(\d{1,2}[-/]\d{1,2}[-/]\d{2,4})\b')
     today = _dt.date.today()
     twelve_months_ago = today - _dt.timedelta(days=365)
-
     best_date: Optional[_dt.date] = None
     best_file: Optional[str] = None
-
     _, _, paths = gather_folder_text(trainings_folder)
 
     for p in paths:
@@ -900,10 +967,8 @@ def extract_training_date(trainings_folder: Path) -> Tuple[str, str, float]:
             t = extract_text_docx(p)
         else:
             t = ''
-
         if not t:
             continue
-
         for date_str in date_pattern.findall(t):
             try:
                 if not dateparser:
@@ -912,26 +977,16 @@ def extract_training_date(trainings_folder: Path) -> Tuple[str, str, float]:
                 if not parsed:
                     continue
                 d = parsed.date()
-                if twelve_months_ago <= d <= today:
-                    if best_date is None or d < best_date:
-                        best_date = d
-                        best_file = p.name
+                if twelve_months_ago <= d <= today and (best_date is None or d < best_date):
+                    best_date = d
+                    best_file = p.name
             except Exception:
                 continue
 
-    if best_date:
-        src = f"TRAININGS/{best_file}" if best_file else "TRAININGS/document"
-        return best_date.strftime("%d/%m/%Y"), src, 0.90
-
-    return generate_random_training_date()
-
-
-def generate_random_training_date() -> Tuple[str, str, float]:
-    """Generate random training date from last 3 months"""
-    today = _dt.date.today()
-    days_ago = random.randint(1, 90)
-    random_date = today - _dt.timedelta(days=days_ago)
-    return random_date.strftime("%d/%m/%Y"), "Random (no valid training in last 12 months)", 0.50
+    if not best_date:
+        return "", "TRAININGS (no valid date found in last 12 months)", 0.0
+    src = f"TRAININGS/{best_file}" if best_file else "TRAININGS/document"
+    return best_date.strftime("%d/%m/%Y"), src, 0.90
 
 def calculate_training_expiry(training_date: str) -> str:
     """Calculate training expiry as training date + 12 months"""
@@ -945,17 +1000,104 @@ def calculate_training_expiry(training_date: str) -> str:
         pass
     return ""
 
-def check_uk_passport(rtw_folder: Path, nationality: str) -> bool:
-    """Check if UK Passport detected in RTW folder or nationality"""
-    if "british" in nationality.lower():
+def check_uk_passport(passport_folder: Path, nationality: str, nationality_source: str = "") -> bool:
+    """Strict UK passport detection: only trust passport-sourced data/text."""
+    low_nat = (nationality or "").strip().lower()
+    low_src = (nationality_source or "").upper()
+    if low_nat in {"british", "united kingdom", "uk", "great britain"} and "PASSPORT" in low_src:
         return True
-    
-    if rtw_folder.exists():
-        text, _, _ = gather_folder_text(rtw_folder)
-        if "uk passport" in text.lower() or "british passport" in text.lower():
-            return True
-    
+    if passport_folder.exists():
+        text, _, _ = gather_folder_text(passport_folder)
+        low = text.lower()
+        patterns = [
+            r"nationality\s*[:\-]?\s*(british|united kingdom|uk)",
+            r"passport\s*type\s*[:\-]?\s*gbr",
+            r"issuing\s*state\s*[:\-]?\s*gbr",
+        ]
+        return any(re.search(p, low, flags=re.I) for p in patterns)
     return False
+
+
+def extract_employment_history_summary(cv_folder: Path) -> Tuple[str, str, float]:
+    if not cv_folder.exists():
+        return "", "CV (no files)", 0.0
+    text, files, _ = gather_folder_text(cv_folder)
+    if not text:
+        return "", "CV (no text)", 0.0
+    block_re = re.compile(
+        r"(?P<company>[A-Z][A-Za-z0-9&.,'() /-]{2,80})"
+        r"(?:\s*[\|,–—-]\s*(?P<role>[A-Z][A-Za-z0-9&.,'() /-]{2,80}))?"
+        r"[\s:,-]{0,8}(?P<dates>(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec|January|February|March|April|June|July|August|September|October|November|December)\s+\d{4}\s*(?:to|-|–|—)\s*(?:Present|Current|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec|January|February|March|April|June|July|August|September|October|November|December)\s+\d{4}))",
+        re.I
+    )
+    rows = []
+    for m in block_re.finditer(text):
+        company = _normalize_spaces(m.group('company'))
+        role = _normalize_spaces(m.group('role') or '')
+        dates = _normalize_spaces(m.group('dates'))
+        if len(company) < 3 or not dates:
+            continue
+        dates = re.sub(r"\s*(?:-|–|—)\s*", " to ", dates)
+        line = f"{company} — {role} — {dates}" if role else f"{company} — {dates}"
+        if line not in rows:
+            rows.append(line)
+        if len(rows) == 3:
+            break
+    return "\n".join(rows), f"CV/{files[0]}" if files else "CV", 0.75 if rows else 0.0
+
+
+def apply_post_processing(extracted: Dict[str, FieldValue]) -> Dict[str, FieldValue]:
+    extracted = auto_derive_names(extracted)
+    gender = normalize_gender(extracted.get("Gender", FieldValue("", "")).value)
+    if gender:
+        extracted["Gender"] = FieldValue(gender, extracted.get("Gender", FieldValue("", "")).source, 0.95, True)
+    title = _normalize_spaces(extracted.get("Title", FieldValue("", "")).value)
+    if not title and gender == "Male":
+        extracted["Title"] = FieldValue("Mr", "Derived from Gender", 0.9, True)
+    elif not title and gender == "Female":
+        extracted["Title"] = FieldValue("Ms", "Derived from Gender", 0.9, True)
+    if "Address" in extracted and extracted["Address"].value:
+        extracted["Address"].value = clean_address(extracted["Address"].value)
+    for key in ["DOB", "DBS Issue Date", "DBS Last Checked Date", "Visa Expiry Date"]:
+        if key in extracted and extracted[key].value:
+            extracted[key].value = normalize_date_value(extracted[key].value)
+    if "Visa Type" in extracted and extracted["Visa Type"].value:
+        extracted["Visa Type"].value = normalize_visa_type(extracted["Visa Type"].value)
+    return extracted
+
+
+def apply_business_overrides(extracted: Dict[str, FieldValue], session_folder: Path) -> Dict[str, FieldValue]:
+    nationality_fv = extracted.get("Nationality", FieldValue("", ""))
+    is_uk_passport = check_uk_passport(session_folder / "PASSPORT", nationality_fv.value, nationality_fv.source)
+    if is_uk_passport:
+        for f in ["RTW Status", "Visa Expiry Date", "Visa Type", "Restriction", "Share Code"]:
+            extracted[f] = FieldValue("NA", "UK Passport detected", 1.0, False)
+    if (extracted.get("Role", FieldValue("", "")).value or "").upper() != "RGN":
+        extracted["NMC PIN"] = FieldValue("NA", "Role is HCA", 1.0, False)
+    visa_type = normalize_visa_type(extracted.get("Visa Type", FieldValue("", "")).value)
+    existing_restriction = _normalize_spaces(extracted.get("Restriction", FieldValue("", "")).value)
+    if visa_type:
+        if any(k in visa_type.lower() for k in ["student", "sponsored"]):
+            extracted["Restriction"] = FieldValue("20 Hours", "Derived from Visa Type", 1.0, True)
+        else:
+            extracted["Restriction"] = FieldValue("NA", "Derived from Visa Type", 1.0, True)
+    elif existing_restriction:
+        extracted["Restriction"].value = existing_restriction
+    return extracted
+
+
+def apply_validation_and_normalization(extracted: Dict[str, FieldValue]) -> Dict[str, FieldValue]:
+    if "NI Number" in extracted:
+        cleaned = validate_ni(extracted["NI Number"].value)
+        extracted["NI Number"] = FieldValue(cleaned, extracted["NI Number"].source if cleaned else "Blanked (invalid NI format)", extracted["NI Number"].confidence if cleaned else 0.0, extracted["NI Number"].ai_filled if cleaned else False)
+    if "DBS Number" in extracted and extracted["DBS Number"].value:
+        cleaned = validate_dbs_number(extracted["DBS Number"].value)
+        extracted["DBS Number"] = FieldValue(cleaned, extracted["DBS Number"].source if cleaned else "Blanked (invalid DBS number)", extracted["DBS Number"].confidence if cleaned else 0.0, extracted["DBS Number"].ai_filled if cleaned else False)
+    if "Gender" in extracted:
+        gender = normalize_gender(extracted["Gender"].value)
+        extracted["Gender"] = FieldValue(gender, extracted["Gender"].source if gender else "Blanked (gender not explicit)", extracted["Gender"].confidence if gender else 0.0, extracted["Gender"].ai_filled if gender else False)
+    return extracted
+
 
 def auto_derive_names(extracted: Dict[str, FieldValue]) -> Dict[str, FieldValue]:
     """Auto-derive Candidate Name from Forename + Surname and vice versa"""
@@ -994,13 +1136,12 @@ def auto_derive_names(extracted: Dict[str, FieldValue]) -> Dict[str, FieldValue]
     return extracted
 
 def smart_extract_with_priority(session_folder: Path) -> Dict[str, FieldValue]:
-    """Extract fields with folder priority logic (with safe fallbacks)."""
+    """Structured pipeline: raw extraction -> priority resolution -> post-processing -> overrides -> validation."""
     extracted: Dict[str, FieldValue] = {}
     folder_texts: Dict[str, str] = {}
     folder_files: Dict[str, List[str]] = {}
     folder_paths: Dict[str, List[Path]] = {}
 
-    # Gather text + assets from each folder
     for folder_name in DOCUMENT_FOLDERS:
         folder_path = session_folder / folder_name
         text_blob, files, paths = gather_folder_text(folder_path)
@@ -1008,107 +1149,61 @@ def smart_extract_with_priority(session_folder: Path) -> Dict[str, FieldValue]:
         folder_files[folder_name] = files
         folder_paths[folder_name] = paths
 
-    # Special: Role detection from NMC folder
     role = detect_role_from_nmc(session_folder / "NMC")
     extracted["Role"] = FieldValue(role, "AUTO (NMC folder detection)", 1.0, False)
 
-    # Special: Training date logic
     training_date, training_source, training_conf = extract_training_date(session_folder / "TRAININGS")
     extracted["Training Date"] = FieldValue(training_date, training_source, training_conf, True)
-
-    # Special: Training expiry = Training date + 12 months
-    training_expiry = calculate_training_expiry(training_date)
+    training_expiry = calculate_training_expiry(training_date) if training_date else ""
     if training_expiry:
-        extracted["Training Expiry Date"] = FieldValue(
-            training_expiry,
-            "Calculated (Training Date + 12 months)",
-            training_conf,
-            True
-        )
+        extracted["Training Expiry Date"] = FieldValue(training_expiry, "Calculated (Training Date + 12 months)", training_conf, True)
 
-    # Extract fields based on priority
+    employment_summary, employment_source, employment_conf = extract_employment_history_summary(session_folder / "CV")
+    if employment_summary:
+        extracted["Employment History Summary"] = FieldValue(employment_summary, employment_source, employment_conf, True)
+
     for field, priority_folders in FIELD_PRIORITY.items():
-        if field in ["Role", "Training Date", "Training Expiry Date"]:
-            continue  # Already handled
-
-        # NMC PIN only relevant if role is RGN
+        if field in ["Role", "Training Date", "Training Expiry Date", "Employment History Summary"]:
+            continue
         if field == "NMC PIN":
             if role == "RGN" and folder_texts.get("NMC"):
                 ai_result = ai_extract_from_text(folder_texts["NMC"], ["NMC PIN"])
                 if "NMC PIN" in ai_result:
                     extracted["NMC PIN"] = ai_result["NMC PIN"]
-                    if folder_files.get('NMC'):
+                    if folder_files.get("NMC"):
                         extracted["NMC PIN"].source = f"NMC/{folder_files.get('NMC')[0]}"
             else:
                 extracted["NMC PIN"] = FieldValue("NA", "Role is HCA", 1.0, False)
             continue
-
-        # Try folders in priority order
         for folder in priority_folders:
             if folder in ("AUTO", "CALCULATED"):
                 continue
-
-            # 1) Text-based AI extraction when we have text
             if folder_texts.get(folder):
                 ai_result = ai_extract_from_text(folder_texts[folder], [field])
-                if field in ai_result:
+                if field in ai_result and _normalize_spaces(ai_result[field].value):
                     extracted[field] = ai_result[field]
-                    if folder_files.get(folder):
-                        extracted[field].source = f"{folder}/{folder_files.get(folder)[0]}"
-                    else:
-                        extracted[field].source = f"{folder}"
+                    extracted[field].source = f"{folder}/{folder_files.get(folder, ['document'])[0]}"
+                    break
+            if folder_paths.get(folder) and ((not folder_texts.get(folder)) or len(folder_texts.get(folder) or "") < 80):
+                ai_result = ai_extract_from_files(folder_paths[folder], [field])
+                if field in ai_result and _normalize_spaces(ai_result[field].value):
+                    extracted[field] = ai_result[field]
+                    extracted[field].source = f"{folder} (attachment fallback)"
+                    break
+                vision_result = ai_extract_from_vision_files(folder_paths[folder], [field])
+                if field in vision_result and _normalize_spaces(vision_result[field].value):
+                    extracted[field] = vision_result[field]
+                    extracted[field].source = f"{folder} (vision fallback)"
                     break
 
-            # 2) Vision-style fallback if folder has files but text is weak/empty
-            if folder_paths.get(folder):
-                # only attempt if not already extracted and we have almost no text
-                if (not folder_texts.get(folder)) or (len(folder_texts.get(folder) or "") < 80):
-                    ai_result = ai_extract_from_files(folder_paths[folder], [field])
-                    if field in ai_result:
-                        extracted[field] = ai_result[field]
-                        extracted[field].source = f"{folder} (attachment fallback)"
-                        break
-
-                    # 3) NEW: Gemini Vision fallback (PDF->images / image attachments) if still blank
-                    vision_result = ai_extract_from_vision_files(folder_paths[folder], [field])
-                    if field in vision_result:
-                        extracted[field] = vision_result[field]
-                        extracted[field].source = f"{folder} (vision fallback)"
-                        break
-
-    # DBS Issue Date: if not extracted from certificate image, use Print Date from DBS check PDF
     if not (extracted.get("DBS Issue Date") and extracted["DBS Issue Date"].value.strip()):
-        dbs_text = folder_texts.get("DBS", "")
-        issue = extract_print_date_from_text(dbs_text)
+        issue = extract_print_date_from_text(folder_texts.get("DBS", ""))
         if issue:
-            extracted["DBS Issue Date"] = FieldValue(
-                issue,
-                "DBS (Print Date used as Issue Date)",
-                0.80,
-                True
-            )
+            extracted["DBS Issue Date"] = FieldValue(issue, "DBS (Print Date used as Issue Date)", 0.80, True)
 
-    # Auto-derive names
-    extracted = auto_derive_names(extracted)
-
-    # Check UK Passport for RTW fields
-    nationality = extracted.get("Nationality", FieldValue("", "")).value
-    is_uk_passport = check_uk_passport(session_folder / "RTW", nationality)
-
-    if is_uk_passport:
-        for f in ["RTW Status", "Visa Expiry Date", "Visa Type", "Restriction", "Share Code"]:
-            extracted[f] = FieldValue("UK Passport", "UK Passport detected", 1.0, False)
-
-    # Validate sensitive fields (never keep invented identifiers)
-    for f in SENSITIVE_FIELDS:
-        if f in extracted:
-            if f == "NI Number":
-                cleaned = validate_ni(extracted[f].value)
-                if not cleaned:
-                    extracted[f] = FieldValue("", "Blanked (invalid NI format)", 0.0, False)
-                else:
-                    extracted[f].value = cleaned
-
+    extracted = apply_post_processing(extracted)
+    extracted = apply_business_overrides(extracted, session_folder)
+    extracted = apply_validation_and_normalization(extracted)
     return extracted
 
 
@@ -1201,6 +1296,55 @@ def replace_placeholders_in_table(table, replacements: Dict[str, str]) -> int:
                 changed += replace_placeholders_in_table(t, replacements)
     return changed
 
+def _replace_exact_placeholder_with_image_in_paragraph(paragraph, placeholder: str, image_path: Optional[Path], width_mm: int = 35, height_mm: int = 45) -> bool:
+    if placeholder not in (paragraph.text or ""):
+        return False
+    for run in paragraph.runs:
+        run.text = ""
+    run = paragraph.runs[0] if paragraph.runs else paragraph.add_run()
+    if image_path and image_path.exists():
+        run.add_picture(str(image_path), width=Mm(width_mm), height=Mm(height_mm))
+    return True
+
+
+def _replace_exact_placeholder_with_image_in_table(table, placeholder: str, image_path: Optional[Path]) -> int:
+    changed = 0
+    for row in table.rows:
+        for cell in row.cells:
+            for p in cell.paragraphs:
+                if _replace_exact_placeholder_with_image_in_paragraph(p, placeholder, image_path):
+                    changed += 1
+            for t in cell.tables:
+                changed += _replace_exact_placeholder_with_image_in_table(t, placeholder, image_path)
+    return changed
+
+
+def _find_latest_candidate_image(image_folder: Path) -> Optional[Path]:
+    if not image_folder.exists():
+        return None
+    candidates = [p for p in image_folder.iterdir() if p.is_file() and p.suffix.lower() in {'.jpg', '.jpeg', '.png'}]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda p: p.stat().st_mtime)
+
+
+def _prepare_candidate_image(image_path: Optional[Path], output_folder: Path) -> Optional[Path]:
+    if not image_path or not image_path.exists() or Image is None:
+        return None
+    output_folder.mkdir(parents=True, exist_ok=True)
+    prepared = output_folder / 'candidate_photo_prepared.png'
+    try:
+        with Image.open(image_path) as img:
+            img = ImageOps.exif_transpose(img)
+            img = img.convert('RGB')
+            target_size = (413, 531)
+            img = img.resize(target_size)
+            img.save(prepared, format='PNG')
+        return prepared
+    except Exception:
+        return None
+
+
 def _find_unfilled_placeholders_docx(d: '_DocxDocument') -> List[str]:
     token_re = re.compile(r"\{\{[^{}]+\}\}")
     leftovers = set()
@@ -1235,32 +1379,42 @@ def _find_unfilled_placeholders_docx(d: '_DocxDocument') -> List[str]:
 
     return sorted(leftovers)
 
-def fill_docx_template(template_path: Path, output_path: Path, replacements: Dict[str, str]) -> Tuple[int, List[str]]:
+def fill_docx_template(template_path: Path, output_path: Path, replacements: Dict[str, str], candidate_image_path: Optional[Path] = None) -> Tuple[int, List[str]]:
     """Fill DOCX template by replacing placeholders robustly (run-safe + tables + header/footer)."""
     warnings: List[str] = []
     d = docx.Document(str(template_path))
     changed = 0
+    image_placeholder = "{{Candidate Photo}}"
 
     for p in d.paragraphs:
-        if replace_placeholders_in_paragraph(p, replacements):
+        if _replace_exact_placeholder_with_image_in_paragraph(p, image_placeholder, candidate_image_path):
+            changed += 1
+        elif replace_placeholders_in_paragraph(p, replacements):
             changed += 1
     for t in d.tables:
+        changed += _replace_exact_placeholder_with_image_in_table(t, image_placeholder, candidate_image_path)
         changed += replace_placeholders_in_table(t, replacements)
 
     try:
         for section in d.sections:
             header = section.header
             for p in header.paragraphs:
-                if replace_placeholders_in_paragraph(p, replacements):
+                if _replace_exact_placeholder_with_image_in_paragraph(p, image_placeholder, candidate_image_path):
+                    changed += 1
+                elif replace_placeholders_in_paragraph(p, replacements):
                     changed += 1
             for t in header.tables:
+                changed += _replace_exact_placeholder_with_image_in_table(t, image_placeholder, candidate_image_path)
                 changed += replace_placeholders_in_table(t, replacements)
 
             footer = section.footer
             for p in footer.paragraphs:
-                if replace_placeholders_in_paragraph(p, replacements):
+                if _replace_exact_placeholder_with_image_in_paragraph(p, image_placeholder, candidate_image_path):
+                    changed += 1
+                elif replace_placeholders_in_paragraph(p, replacements):
                     changed += 1
             for t in footer.tables:
+                changed += _replace_exact_placeholder_with_image_in_table(t, image_placeholder, candidate_image_path)
                 changed += replace_placeholders_in_table(t, replacements)
     except Exception as e:
         warnings.append(f"Header/footer replace skipped: {e}")
@@ -1659,42 +1813,38 @@ def process_documents():
             shutil.rmtree(output_folder)
         output_folder.mkdir(parents=True, exist_ok=True)
 
-        full_name = (flat_field_values.get('Candidate Name') or '').strip()
-        if not full_name:
-            full_name = 'Candidate'
-        name_parts = full_name.split()
-        first_name = name_parts[0] if name_parts else ''
-        last_name = name_parts[-1] if len(name_parts) > 1 else ''
-        role = (flat_field_values.get('Role') or '').strip()
-        yes_na = 'NA' if role.upper() == 'HCA' else 'YES'
+        full_name = (flat_field_values.get('Candidate Name') or '').strip() or 'Candidate'
         todays = _dt.date.today().strftime('%d/%m/%Y')
-        nationality = (flat_field_values.get('Nationality') or '').strip().lower()
-        if 'british' in nationality or nationality == 'uk':
-            for k in ['RTW Status', 'Visa Expiry Date', 'Visa Type', 'Restriction', 'Share Code']:
-                flat_field_values[k] = 'UK Passport'
         replacements = {
-            'Candidate Name': full_name, 'Candidate First Name': first_name, 'Candidate First name': first_name,
-            'Candidate surname': last_name, 'Candidate last name': last_name,
-            'Candidate Address': flat_field_values.get('Address', ''), 'Candidate address': flat_field_values.get('Address', ''),
-            'Address': flat_field_values.get('Address', ''), 'Candidate Mobile Number': flat_field_values.get('Phone', ''),
-            'Phone': flat_field_values.get('Phone', ''), 'DOB': flat_field_values.get('DOB', ''), 'D.O.B': flat_field_values.get('DOB', ''),
-            'Date Of Birth': flat_field_values.get('DOB', ''), 'Nationality': flat_field_values.get('Nationality', ''),
-            'HCA/RGN': role, ' HCA/RGN': role, 'NI Number': flat_field_values.get('NI Number', ''),
-            'NMC Pin Number': flat_field_values.get('NMC PIN', ''), 'NMC Pin number': flat_field_values.get('NMC PIN', ''),
-            'NMC pin': flat_field_values.get('NMC PIN', ''), 'DBS Certificate Number': flat_field_values.get('DBS Number', ''),
-            'DBS certificate number': flat_field_values.get('DBS Number', ''), 'DBS Certificate issue date': flat_field_values.get('DBS Issue Date', ''),
-            'DBS certificate issue date': flat_field_values.get('DBS Issue Date', ''), 'DBS Certificate last checked date': flat_field_values.get('DBS Last Checked Date', ''),
-            'DBS last checked date': flat_field_values.get('DBS Last Checked Date', ''), 'DBS expiry date': flat_field_values.get('DBS Last Checked Date', ''),
-            'Training completion date': flat_field_values.get('Training Date', ''), 'Training expiry date': flat_field_values.get('Training Expiry Date', ''),
-            'Right to work expiry date': flat_field_values.get('Visa Expiry Date', ''), 'Right To Work Expiry Date': flat_field_values.get('Visa Expiry Date', ''),
-            'Type of visa': flat_field_values.get('Visa Type', ''), 'Restriction': flat_field_values.get('Restriction', ''),
-            "Today's Date": todays, "Today's date": todays, 'YES/NA': yes_na, 'Candidate share code': flat_field_values.get('Share Code', ''),
-            'Form Completed By': flat_field_values.get('Form Completed By', ''), 'form completed by': flat_field_values.get('Form Completed By', ''),
-            'Signature': flat_field_values.get('Signature', ''), 'signature': flat_field_values.get('Signature', ''),
-            'Position': flat_field_values.get('Position', ''), 'position': flat_field_values.get('Position', ''),
+            'Candidate Name': full_name,
+            'Title': flat_field_values.get('Title', ''),
+            'Forename(s)': flat_field_values.get('Forename(s)', ''),
+            'Surname': flat_field_values.get('Surname', ''),
+            'Email': flat_field_values.get('Email', ''),
+            'Phone': flat_field_values.get('Phone', ''),
+            'DOB': flat_field_values.get('DOB', ''),
+            'Address': flat_field_values.get('Address', ''),
+            'Nationality': flat_field_values.get('Nationality', ''),
+            'NI Number': flat_field_values.get('NI Number', ''),
+            'Role': flat_field_values.get('Role', ''),
+            'NMC PIN': flat_field_values.get('NMC PIN', ''),
+            'DBS Number': flat_field_values.get('DBS Number', ''),
+            'DBS Issue Date': flat_field_values.get('DBS Issue Date', ''),
+            'DBS Last Checked Date': flat_field_values.get('DBS Last Checked Date', ''),
+            'Training Date': flat_field_values.get('Training Date', ''),
+            'Training Expiry Date': flat_field_values.get('Training Expiry Date', ''),
+            'RTW Status': flat_field_values.get('RTW Status', ''),
+            'Visa Expiry Date': flat_field_values.get('Visa Expiry Date', ''),
+            'Visa Type': flat_field_values.get('Visa Type', ''),
+            'Restriction': flat_field_values.get('Restriction', ''),
+            'Share Code': flat_field_values.get('Share Code', ''),
+            'Gender': flat_field_values.get('Gender', ''),
+            'Employment History Summary': flat_field_values.get('Employment History Summary', ''),
+            "Today's Date": todays,
+            'Form Completed By': flat_field_values.get('Form Completed By', ''),
+            'Signature': flat_field_values.get('Signature', ''),
+            'Position': flat_field_values.get('Position', ''),
         }
-        for k, v in flat_field_values.items():
-            replacements.setdefault(k, v or '')
 
         generated_files = []
         file_downloads = []
@@ -1712,7 +1862,8 @@ def process_documents():
             output_filename = _build_output_filename(full_name, tmpl['template_name'], output_folder)
             output_path = output_folder / output_filename
             try:
-                _, warnings = fill_docx_template(template_path, output_path, replacements)
+                image_path = _prepare_candidate_image(_find_latest_candidate_image(_upload_folder(tenant_id, user_id, session_id) / 'IMAGE'), output_folder)
+                _, warnings = fill_docx_template(template_path, output_path, replacements, candidate_image_path=image_path)
                 if warnings:
                     errors.extend([f"{tmpl['template_name']}: {w}" for w in warnings])
                 generated_files.append(output_filename)
