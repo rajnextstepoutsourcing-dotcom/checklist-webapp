@@ -260,6 +260,7 @@ TEMPLATE_METADATA = [
     {'template_key': 'lc_profile', 'template_name': 'LC Profile', 'file_name': 'LC Profile.docx', 'active': True, 'order': 6},
     {'template_key': 'mha_profile', 'template_name': 'MHA PROFILE', 'file_name': 'MHA PROFILE.docx', 'active': True, 'order': 7},
     {'template_key': 'neuven_new', 'template_name': 'neuven new', 'file_name': 'neuven new.docx', 'active': True, 'order': 8},
+     {'template_key': 'omni_profile', 'template_name': 'OMNI PROFILE', 'file_name': 'OMNI PROFILE.docx', 'active': True, 'order': 9},
 ]
 
 STANDARD_FIELDS = [
