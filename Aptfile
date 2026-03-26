@@ -1,1 +1,3 @@
-# OCR packages removed; Gemini-only extraction.
+tesseract-ocr
+tesseract-ocr-eng
+libtesseract-dev

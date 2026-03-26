@@ -12,12 +12,11 @@ import time
 import uuid
 import traceback
 import difflib
-import csv
-import io
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any
 import datetime as _dt
+import random
 import threading
 import logging
 
@@ -31,15 +30,27 @@ from flask_cors import CORS
 from werkzeug.utils import secure_filename
 from werkzeug.exceptions import HTTPException
 import zipfile
+import csv
+from io import StringIO, BytesIO
+
+try:
+    from openpyxl import Workbook
+except Exception:
+    Workbook = None
 
 # ===== Optional imports (graceful degradation) =====
+try:
+    import pdfplumber
+except Exception:
+    pdfplumber = None
+
 try:
     import fitz  # PyMuPDF
 except Exception:
     fitz = None
 
 try:
-    from PIL import Image, ImageFile, ImageOps
+    from PIL import Image, ImageFile, ImageOps, ImageEnhance, ImageFilter
     ImageFile.LOAD_TRUNCATED_IMAGES = True
     try:
         Image.MAX_IMAGE_PIXELS = 250_000_000
@@ -48,6 +59,10 @@ try:
 except Exception:
     Image = None
     ImageOps = None
+    ImageEnhance = None
+    ImageFilter = None
+
+pytesseract = None
 
 try:
     from tenacity import retry, stop_after_attempt, wait_exponential
@@ -75,19 +90,8 @@ except Exception as e:
 
 try:
     from dateutil import parser as dateparser
-    from dateutil.relativedelta import relativedelta
 except Exception:
     dateparser = None
-    relativedelta = None
-
-try:
-    from openpyxl import Workbook
-    from openpyxl.styles import Font, PatternFill, Alignment
-except Exception:
-    Workbook = None
-    Font = None
-    PatternFill = None
-    Alignment = None
 
 # ===== Flask App Configuration =====
 app = Flask(__name__)
@@ -264,7 +268,7 @@ STANDARD_FIELDS = [
     "Address", "Phone", "DOB", "Nationality", "NI Number",
     "Role", "NMC PIN", "DBS Number", "DBS Issue Date",
     "DBS Last Checked Date", "Training Date", "Training Expiry Date",
-    "RTW Status", "Visa Start Date", "Visa Expiry Date", "Visa Type", "Restriction",
+    "RTW Status", "RTW Check Date", "Visa Start Date", "Visa Expiry Date", "Visa Type", "Restriction",
     "Gender", "Employment History Summary", "Form Completed By", "Signature", "Position"
 ]
 
@@ -345,7 +349,7 @@ def validate_dbs_number(value: str) -> str:
     return m.group(0) if m else ""
 
 
-def normalize_date_value(value: str, output_format: str = "%d/%m/%y") -> str:
+def normalize_date_value(value: str) -> str:
     value = _normalize_spaces(value)
     if not value:
         return ""
@@ -353,31 +357,10 @@ def normalize_date_value(value: str, output_format: str = "%d/%m/%y") -> str:
         if dateparser:
             parsed = dateparser.parse(value, dayfirst=True, fuzzy=True)
             if parsed:
-                return parsed.date().strftime(output_format)
+                return parsed.date().strftime("%d/%m/%y")
     except Exception:
         pass
     return value
-
-
-def parse_date_value(value: str) -> Optional[_dt.date]:
-    value = _normalize_spaces(value)
-    if not value or not dateparser:
-        return None
-    try:
-        parsed = dateparser.parse(value, dayfirst=True, fuzzy=True)
-        return parsed.date() if parsed else None
-    except Exception:
-        return None
-
-
-def shift_date(value: str, *, months: int = 0, years: int = 0) -> str:
-    parsed = parse_date_value(value)
-    if not parsed:
-        return ""
-    if relativedelta:
-        return (parsed + relativedelta(months=months, years=years)).strftime("%d/%m/%y")
-    days = years * 365 + months * 30
-    return (parsed + _dt.timedelta(days=days)).strftime("%d/%m/%y")
 
 
 def normalize_gender(value: str) -> str:
@@ -428,7 +411,7 @@ def extract_print_date_from_text(text: str) -> str:
                 if dateparser:
                     d = dateparser.parse(ds, dayfirst=True)
                     if d:
-                        return d.date().strftime("%d/%m/%Y")
+                        return d.date().strftime("%d/%m/%y")
             except Exception:
                 return ds
 
@@ -443,7 +426,7 @@ def extract_print_date_from_text(text: str) -> str:
                 if dateparser:
                     d = dateparser.parse(ds, dayfirst=True)
                     if d:
-                        return d.date().strftime("%d/%m/%Y")
+                        return d.date().strftime("%d/%m/%y")
             except Exception:
                 return ds
     return ""
@@ -485,27 +468,62 @@ class FieldValue:
 
 # ===== CORE EXTRACTION FUNCTIONS =====
 
+def extract_text_pdf(pdf_path: Path) -> str:
+    """Extract text from PDF using pdfplumber"""
+    if not pdfplumber:
+        return ""
+    
+    try:
+        text_parts = []
+        with pdfplumber.open(pdf_path) as pdf:
+            for page in pdf.pages:
+                page_text = page.extract_text() or ""
+                text_parts.append(page_text)
+        return "\n".join(text_parts)
+    except Exception as e:
+        print(f"PDF extraction error for {pdf_path}: {e}")
+        return ""
+
+def _ocr_score(text: str) -> int:
+    return 0
+
+def _preprocess_for_ocr(img: 'Image.Image') -> 'Image.Image':
+    return img
+
+def _ocr_image_best(img: 'Image.Image') -> str:
+    return ""
+
+def extract_text_image(img_path: Path) -> str:
+    """OCR removed; Gemini-only extraction should be used for images."""
+    return ""
+
+
 def extract_text_docx(docx_path: Path) -> str:
-    """Extract text from DOCX for Gemini text prompting when useful."""
+    """Extract text from DOCX"""
     try:
         doc = docx.Document(docx_path)
         text_parts = []
+        
         for para in doc.paragraphs:
             text_parts.append(para.text)
+        
         for table in doc.tables:
             for row in table.rows:
                 for cell in row.cells:
                     text_parts.append(cell.text)
+        
         return "\n".join(text_parts)
     except Exception as e:
         print(f"DOCX extraction error for {docx_path}: {e}")
         return ""
 
 def gather_folder_text(folder: Path) -> Tuple[str, List[str], List[Path]]:
-    """Collect supported file paths and lightweight text only for docx/txt.
+    """Gather all text from a specific folder.
 
-    Gemini remains the primary extraction engine. Local text is gathered only
-    where Python can safely read native text formats without OCR or PDF parsing.
+    Returns:
+      - combined text (with file markers),
+      - processed file names,
+      - processed file paths (for optional AI-vision fallback).
     """
     all_text: List[str] = []
     processed_files: List[str] = []
@@ -517,22 +535,35 @@ def gather_folder_text(folder: Path) -> Tuple[str, List[str], List[Path]]:
     for file_path in folder.iterdir():
         if not file_path.is_file():
             continue
+
         ext = file_path.suffix.lower()
         extracted_text = ""
+
         try:
+            # Always track supported files for AI file-attachment fallback,
+            # even if OCR/text-layer extraction returns empty text.
             if ext in {'.pdf', '.png', '.jpg', '.jpeg', '.docx', '.txt'}:
                 processed_files.append(file_path.name)
                 processed_paths.append(file_path)
-            if ext == '.docx':
+
+            if ext == '.pdf':
+                extracted_text = extract_text_pdf(file_path)
+            elif ext in {'.png', '.jpg', '.jpeg'}:
+                extracted_text = extract_text_image(file_path)
+            elif ext == '.docx':
                 extracted_text = extract_text_docx(file_path)
             elif ext == '.txt':
+                # Be forgiving with encodings.
                 extracted_text = file_path.read_text(encoding='utf-8', errors='ignore')
+
             if extracted_text:
                 all_text.append(f"\n=== {file_path.name} ===\n{extracted_text}")
+
         except Exception as e:
             print(f"Error processing {file_path}: {e}")
 
     return "\n".join(all_text), processed_files, processed_paths
+
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10))
 def _gemini_generate(model: str, contents):
@@ -647,8 +678,6 @@ def ai_extract_from_files(file_paths: List[Path], fields_to_extract: List[str]) 
                 mime = 'application/pdf'
             elif ext == '.docx':
                 mime = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
-            elif ext == '.txt':
-                mime = 'text/plain'
             parts.append(types.Part.from_bytes(data=b, mime_type=mime))
         except Exception:
             continue
@@ -763,7 +792,9 @@ def ai_extract_from_vision_files(file_paths: List[Path], fields_to_extract: List
         "DBS Issue Date": ["DBS Issue Date", "Issue Date", "Date of Issue", "Print Date", "Printed on", "Date Printed"],
         "NI Number": ["NI Number", "National Insurance Number", "NINO"],
         "NMC PIN": ["NMC PIN", "PIN", "NMC Pin Number"],
-        "Visa Expiry Date": ["Visa Expiry Date", "Expiry Date"],
+        "RTW Check Date": ["Date of check", "Check Date"],
+        "Visa Start Date": ["Visa Start Date", "Valid From", "Start Date", "From"],
+        "Visa Expiry Date": ["Visa Expiry Date", "Expiry Date", "Expires On", "Until"],
         "Visa Type": ["Visa Type", "Type of visa"],
         "Restriction": ["Restriction"],
         "RTW Status": ["Right to Work", "RTW Status"],
@@ -836,102 +867,78 @@ def detect_role_from_nmc(nmc_folder: Path) -> str:
         return "RGN"
     return "HCA"
 
-def _run_gemini_json_prompt(prompt: str, file_paths: Optional[List[Path]] = None) -> Dict[str, Any]:
-    if not gemini_client:
-        return {}
-
-    file_paths = [p for p in (file_paths or []) if p.exists()]
-    if file_paths:
-        try:
-            from google.genai import types  # type: ignore
-        except Exception:
-            types = None
-        else:
-            parts = []
-            for p in file_paths[:8]:
-                try:
-                    ext = p.suffix.lower()
-                    mime = 'application/octet-stream'
-                    if ext in ['.jpg', '.jpeg']:
-                        mime = 'image/jpeg'
-                    elif ext == '.png':
-                        mime = 'image/png'
-                    elif ext == '.pdf':
-                        mime = 'application/pdf'
-                    elif ext == '.docx':
-                        mime = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
-                    elif ext == '.txt':
-                        mime = 'text/plain'
-                    parts.append(types.Part.from_bytes(data=p.read_bytes(), mime_type=mime))
-                except Exception:
-                    continue
-            if parts:
-                for model in [GEMINI_MODEL_FAST, GEMINI_MODEL_STRONG]:
-                    try:
-                        try:
-                            contents = [types.Content(role="user", parts=[types.Part.from_text(prompt)] + parts)]
-                        except Exception:
-                            contents = [prompt, *parts]
-                        resp = _gemini_generate(model=model, contents=contents)
-                        data = _parse_json_response(getattr(resp, 'text', '') or '')
-                        if isinstance(data, dict):
-                            return data
-                    except Exception:
-                        continue
-
-    for model in [GEMINI_MODEL_FAST, GEMINI_MODEL_STRONG]:
-        try:
-            resp = _gemini_generate(model=model, contents=prompt)
-            data = _parse_json_response(getattr(resp, 'text', '') or '')
-            if isinstance(data, dict):
-                return data
-        except Exception:
-            continue
-    return {}
-
-
 def extract_training_date(trainings_folder: Path) -> Tuple[str, str, float]:
-    """Gemini-only training extraction. Returns earliest valid date in last 12 months."""
+    """Gemini-only extraction of earliest valid training/completion date within last 12 months."""
     if not trainings_folder.exists():
         return "", "TRAININGS (no files)", 0.0
-
-    _, _, paths = gather_folder_text(trainings_folder)
+    paths = [p for p in trainings_folder.iterdir() if p.is_file() and allowed_file(p.name)]
     if not paths:
         return "", "TRAININGS (no files)", 0.0
 
+    fields = ["Training Date"]
     today = _dt.date.today()
     twelve_months_ago = today - _dt.timedelta(days=365)
     candidates: List[Tuple[_dt.date, str]] = []
 
     for p in paths:
-        prompt = """Extract the main training completion or attended date from this training certificate/document.
-
-Return JSON only in this exact format:
-{
-  "training_date": ""
-}
-
-Rules:
-- Use only the main training/completion/attended/issue date for the certificate.
-- Ignore expiry dates, print dates, generated dates, and unrelated dates.
-- If no clear training/completion date is visible, return an empty string.
-- Dates may appear in any common format.
-"""
-        data = _run_gemini_json_prompt(prompt, [p])
-        parsed = parse_date_value(str(data.get('training_date', '')))
-        if parsed and twelve_months_ago <= parsed <= today:
-            candidates.append((parsed, p.name))
+        value = ""
+        result = ai_extract_from_files([p], fields)
+        if result.get("Training Date") and result["Training Date"].value:
+            value = result["Training Date"].value
+        if not value:
+            prompt = (
+                "Extract the main training completion date from the attached training certificate/document. "
+                "Prefer completion date, attended date, or issue date in that order. Ignore expiry date unless it is the only meaningful date. "
+                "Return ONLY JSON like {\"Training Date\":\"dd/mm/yy\"}."
+            )
+            try:
+                from google.genai import types  # type: ignore
+                ext = p.suffix.lower()
+                if gemini_client and ext in ['.pdf', '.png', '.jpg', '.jpeg', '.docx', '.txt']:
+                    if ext == '.txt':
+                        payload = [prompt + "\n\n" + p.read_text(errors='ignore')]
+                    else:
+                        mime_map = {
+                            '.pdf': 'application/pdf',
+                            '.png': 'image/png',
+                            '.jpg': 'image/jpeg',
+                            '.jpeg': 'image/jpeg',
+                            '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+                        }
+                        payload = [prompt, types.Part.from_bytes(data=p.read_bytes(), mime_type=mime_map.get(ext, 'application/octet-stream'))]
+                    resp = _gemini_generate(model=GEMINI_MODEL_FAST, contents=payload)
+                    data = _parse_json_response(getattr(resp, 'text', '') or '')
+                    value = str((data or {}).get('Training Date', '')).strip()
+            except Exception:
+                value = value or ""
+        if not value:
+            continue
+        try:
+            parsed = dateparser.parse(value, dayfirst=True, fuzzy=True) if dateparser else None
+            if not parsed:
+                continue
+            d = parsed.date()
+            if twelve_months_ago <= d <= today:
+                candidates.append((d, p.name))
+        except Exception:
+            continue
 
     if not candidates:
         return "", "TRAININGS (no valid date found in last 12 months)", 0.0
-
-    best_date, best_file = sorted(candidates, key=lambda item: item[0])[0]
+    best_date, best_file = sorted(candidates, key=lambda x: x[0])[0]
     return best_date.strftime("%d/%m/%y"), f"TRAININGS/{best_file}", 0.90
 
-
 def calculate_training_expiry(training_date: str) -> str:
-    """Calculate training expiry as training date + 12 months."""
-    return shift_date(training_date, years=1)
+    """Calculate training expiry as training date + 12 months"""
+    try:
+        if dateparser:
+            parsed = dateparser.parse(training_date, dayfirst=True)
+            if parsed:
+                expiry = parsed.date() + _dt.timedelta(days=365)
+                return expiry.strftime("%d/%m/%y")
+    except:
+        pass
+    return ""
 
 def check_uk_passport(passport_folder: Path, nationality: str, nationality_source: str = "") -> bool:
     """Strict UK passport detection: only trust passport-sourced data/text."""
@@ -979,45 +986,93 @@ def extract_employment_history_summary(cv_folder: Path) -> Tuple[str, str, float
     return "\n".join(rows), f"CV/{files[0]}" if files else "CV", 0.75 if rows else 0.0
 
 
+
+
+def _add_months_safe(d: _dt.date, months: int) -> _dt.date:
+    year = d.year + ((d.month - 1 + months) // 12)
+    month = ((d.month - 1 + months) % 12) + 1
+    day = min(d.day, [31, 29 if year % 4 == 0 and (year % 100 != 0 or year % 400 == 0) else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month-1])
+    return _dt.date(year, month, day)
+
 def extract_rtw_fields(rtw_folder: Path) -> Dict[str, FieldValue]:
     if not rtw_folder.exists():
         return {}
-    _, files, paths = gather_folder_text(rtw_folder)
+    paths = [p for p in rtw_folder.iterdir() if p.is_file() and allowed_file(p.name)]
     if not paths:
         return {}
-
-    prompt = """Extract right-to-work details from the attached RTW documents. Return JSON only in this exact format:
+    prompt = """Extract right-to-work details from the attached UK right-to-work document(s). Return ONLY JSON with these exact fields:
 {
   "RTW Status": "",
+  "RTW Check Date": "",
   "Visa Start Date": "",
   "Visa Expiry Date": "",
   "Visa Type": "",
   "Restriction": ""
 }
-
 Rules:
-- Use dd/mm/yy for all returned dates.
-- If the document says the person has the right to work in the UK, set RTW Status to "Valid".
-- If the document says "They can work in any job except...", set Visa Type to "Work Visa" and Restriction to "No restriction".
-- If it says "They must work for the employer who sponsored them", set Visa Type to "Sponsored Visa" and Restriction to "20 Hours".
-- If it says "up to 20 hours a week during term time", set Visa Type to "Student Visa" and Restriction to "20 Hours".
-- If it says "This check is valid for 6 months from today’s date" or similar, treat it as a work visa with no restriction. Use the Date of check as Visa Start Date and set Visa Expiry Date to 6 months after the Date of check.
-- Prefer explicit "right to work in the UK from ..." as Visa Start Date when present.
-- Prefer explicit "until ..." or "expires on ..." as Visa Expiry Date when present.
-- If a field is not clear, return an empty string.
-"""
-    data = _run_gemini_json_prompt(prompt, paths)
-    if not isinstance(data, dict):
+- Dates must be in dd/mm/yy format.
+- If wording says 'They can work in any job except...' then Visa Type = Work Visa and Restriction = No Restriction.
+- If wording says 'They must work for the employer who sponsored them' then Visa Type = Sponsored Visa and Restriction = 20 Hours.
+- If wording says 'up to 20 hours a week during term time' then Visa Type = Student Visa and Restriction = 20 Hours.
+- If wording says 'This check is valid for 6 months from today's date' then Visa Type = Work Visa, Restriction = No Restriction, Visa Start Date = RTW Check Date, Visa Expiry Date = RTW Check Date plus 6 months.
+- Prefer explicit 'from' date for Visa Start Date and explicit 'until'/'expires on' date for Visa Expiry Date.
+- Keep blanks as empty strings.
+Return JSON only."""
+    try:
+        from google.genai import types  # type: ignore
+    except Exception:
         return {}
-
-    result: Dict[str, FieldValue] = {}
-    source_name = f"RTW/{files[0]}" if files else "RTW/document"
-    for field in ["RTW Status", "Visa Start Date", "Visa Expiry Date", "Visa Type", "Restriction"]:
-        value = _normalize_spaces(str(data.get(field, "")))
+    parts = []
+    mime_map = {'.pdf':'application/pdf','.png':'image/png','.jpg':'image/jpeg','.jpeg':'image/jpeg','.docx':'application/vnd.openxmlformats-officedocument.wordprocessingml.document','.txt':'text/plain'}
+    for p in paths:
+        try:
+            ext = p.suffix.lower()
+            if ext == '.txt':
+                parts.append(p.read_text(errors='ignore'))
+            else:
+                parts.append(types.Part.from_bytes(data=p.read_bytes(), mime_type=mime_map.get(ext,'application/octet-stream')))
+        except Exception:
+            continue
+    if not parts or not gemini_client:
+        return {}
+    try:
+        resp = _gemini_generate(model=GEMINI_MODEL_FAST, contents=[prompt, *parts])
+        data = _parse_json_response(getattr(resp, 'text', '') or '')
+        if not isinstance(data, dict):
+            data = {}
+    except Exception:
+        data = {}
+    out = {}
+    for field in ["RTW Status", "RTW Check Date", "Visa Start Date", "Visa Expiry Date", "Visa Type", "Restriction"]:
+        value = _normalize_spaces(str(data.get(field, '') or ''))
         if value:
-            result[field] = FieldValue(value, source_name, 0.88, True)
-    return result
+            out[field] = FieldValue(value, f"RTW/{paths[0].name}", 0.9, True)
 
+    check_date_raw = out.get('RTW Check Date', FieldValue('', '')).value
+    try:
+        check_date = dateparser.parse(check_date_raw, dayfirst=True, fuzzy=True).date() if check_date_raw and dateparser else None
+    except Exception:
+        check_date = None
+
+    visa_type = (out.get('Visa Type', FieldValue('', '')).value or '').lower()
+    restriction = (out.get('Restriction', FieldValue('', '')).value or '').lower()
+    if 'student' in visa_type or '20' in restriction and 'student' in restriction:
+        out['Visa Type'] = FieldValue('Student Visa', out.get('Visa Type', FieldValue('', '')).source or f"RTW/{paths[0].name}", 1.0, True)
+        out['Restriction'] = FieldValue('20 Hours', out.get('Restriction', FieldValue('', '')).source or f"RTW/{paths[0].name}", 1.0, True)
+    elif 'sponsor' in visa_type or 'sponsored' in visa_type:
+        out['Visa Type'] = FieldValue('Sponsored Visa', out.get('Visa Type', FieldValue('', '')).source or f"RTW/{paths[0].name}", 1.0, True)
+        out['Restriction'] = FieldValue('20 Hours', out.get('Restriction', FieldValue('', '')).source or f"RTW/{paths[0].name}", 1.0, True)
+    elif 'work' in visa_type or 'any job' in restriction or 'no restriction' in restriction:
+        out['Visa Type'] = FieldValue('Work Visa', out.get('Visa Type', FieldValue('', '')).source or f"RTW/{paths[0].name}", 1.0, True)
+        out['Restriction'] = FieldValue('No Restriction', out.get('Restriction', FieldValue('', '')).source or f"RTW/{paths[0].name}", 1.0, True)
+
+    if check_date and not out.get('Visa Start Date') and (out.get('Visa Type', FieldValue('', '')).value == 'Work Visa') and out.get('Visa Expiry Date') and out['Visa Expiry Date'].value == '':
+        pass
+    if check_date and out.get('Visa Type', FieldValue('', '')).value == 'Work Visa' and not out.get('Visa Start Date') and not out.get('Visa Expiry Date'):
+        out['Visa Start Date'] = FieldValue(check_date.strftime('%d/%m/%y'), f"RTW/{paths[0].name}", 1.0, True)
+        out['Visa Expiry Date'] = FieldValue(_add_months_safe(check_date, 6).strftime('%d/%m/%y'), f"RTW/{paths[0].name}", 1.0, True)
+
+    return out
 
 def apply_post_processing(extracted: Dict[str, FieldValue]) -> Dict[str, FieldValue]:
     extracted = auto_derive_names(extracted)
@@ -1031,22 +1086,11 @@ def apply_post_processing(extracted: Dict[str, FieldValue]) -> Dict[str, FieldVa
         extracted["Title"] = FieldValue("Ms", "Derived from Gender", 0.9, True)
     if "Address" in extracted and extracted["Address"].value:
         extracted["Address"].value = clean_address(extracted["Address"].value)
-    for key in ["DOB", "DBS Issue Date", "DBS Last Checked Date", "Visa Start Date", "Visa Expiry Date"]:
+    for key in ["DOB", "DBS Issue Date", "DBS Last Checked Date", "Visa Start Date", "Visa Expiry Date", "RTW Check Date"]:
         if key in extracted and extracted[key].value:
             extracted[key].value = normalize_date_value(extracted[key].value)
-    if "Training Date" in extracted and extracted["Training Date"].value:
-        extracted["Training Date"].value = normalize_date_value(extracted["Training Date"].value)
-    if "Training Expiry Date" in extracted and extracted["Training Expiry Date"].value:
-        extracted["Training Expiry Date"].value = normalize_date_value(extracted["Training Expiry Date"].value)
     if "Visa Type" in extracted and extracted["Visa Type"].value:
         extracted["Visa Type"].value = normalize_visa_type(extracted["Visa Type"].value)
-    if "Restriction" in extracted and extracted["Restriction"].value:
-        extracted["Restriction"].value = _normalize_spaces(extracted["Restriction"].value)
-    # Force candidate full name order to Forename + Surname whenever both exist.
-    forename = _normalize_spaces(extracted.get("Forename(s)", FieldValue("", "")).value)
-    surname = _normalize_spaces(extracted.get("Surname", FieldValue("", "")).value)
-    if forename and surname:
-        extracted["Candidate Name"] = FieldValue(f"{forename} {surname}", "Derived from Forename + Surname", 0.95, True)
     return extracted
 
 
@@ -1054,21 +1098,24 @@ def apply_business_overrides(extracted: Dict[str, FieldValue], session_folder: P
     nationality_fv = extracted.get("Nationality", FieldValue("", ""))
     is_uk_passport = check_uk_passport(session_folder / "PASSPORT", nationality_fv.value, nationality_fv.source)
     if is_uk_passport:
-        for f in ["RTW Status", "Visa Start Date", "Visa Expiry Date", "Visa Type", "Restriction"]:
-            extracted[f] = FieldValue("NA", "UK Passport detected", 1.0, False)
+        extracted["RTW Status"] = FieldValue("Valid", "UK Passport detected", 1.0, False)
+        extracted["Visa Start Date"] = FieldValue("NA", "UK Passport detected", 1.0, False)
+        extracted["Visa Expiry Date"] = FieldValue("NA", "UK Passport detected", 1.0, False)
+        extracted["Visa Type"] = FieldValue("NA", "UK Passport detected", 1.0, False)
+        extracted["Restriction"] = FieldValue("NA", "UK Passport detected", 1.0, False)
     if (extracted.get("Role", FieldValue("", "")).value or "").upper() != "RGN":
         extracted["NMC PIN"] = FieldValue("NA", "Role is HCA", 1.0, False)
-
     visa_type = normalize_visa_type(extracted.get("Visa Type", FieldValue("", "")).value)
-    restriction_value = _normalize_spaces(extracted.get("Restriction", FieldValue("", "")).value)
-    low = visa_type.lower()
+    existing_restriction = _normalize_spaces(extracted.get("Restriction", FieldValue("", "")).value)
     if visa_type:
-        if "student" in low or "sponsored" in low:
-            extracted["Restriction"] = FieldValue("20 Hours", extracted.get("Restriction", FieldValue("", "Derived from Visa Type")).source or "Derived from Visa Type", 1.0, True)
-        elif "work visa" in low or "skilled worker" in low or "health and care" in low or "graduate" in low or not restriction_value:
-            extracted["Restriction"] = FieldValue("No restriction", extracted.get("Restriction", FieldValue("", "Derived from Visa Type")).source or "Derived from Visa Type", 1.0, True)
-    elif restriction_value:
-        extracted["Restriction"].value = restriction_value
+        if any(k in visa_type.lower() for k in ["student", "sponsored"]):
+            extracted["Restriction"] = FieldValue("20 Hours", "Derived from Visa Type", 1.0, True)
+        elif "work" in visa_type.lower():
+            extracted["Restriction"] = FieldValue("No Restriction", "Derived from Visa Type", 1.0, True)
+        else:
+            extracted["Restriction"] = FieldValue("NA", "Derived from Visa Type", 1.0, True)
+    elif existing_restriction:
+        extracted["Restriction"].value = existing_restriction
     return extracted
 
 
@@ -1110,19 +1157,19 @@ def auto_derive_names(extracted: Dict[str, FieldValue]) -> Dict[str, FieldValue]
                     True
                 )
     
-    # If we have Forename + Surname, always use that order for Candidate Name
-    elif forename.value and surname.value:
+    # If we have Forename + Surname but not Candidate Name
+    elif forename.value and surname.value and not candidate_name.value:
         extracted["Candidate Name"] = FieldValue(
             f"{forename.value} {surname.value}",
             f"Derived from Forename + Surname",
-            min(forename.confidence or 1.0, surname.confidence or 1.0) * 0.95,
+            min(forename.confidence, surname.confidence) * 0.95,
             True
         )
     
     return extracted
 
 def smart_extract_with_priority(session_folder: Path) -> Dict[str, FieldValue]:
-    """Structured pipeline: Gemini-first extraction -> post-processing -> overrides -> validation."""
+    """Structured pipeline: raw extraction -> priority resolution -> post-processing -> overrides -> validation."""
     extracted: Dict[str, FieldValue] = {}
     folder_texts: Dict[str, str] = {}
     folder_files: Dict[str, List[str]] = {}
@@ -1148,51 +1195,46 @@ def smart_extract_with_priority(session_folder: Path) -> Dict[str, FieldValue]:
     if employment_summary:
         extracted["Employment History Summary"] = FieldValue(employment_summary, employment_source, employment_conf, True)
 
-    rtw_fields = extract_rtw_fields(session_folder / "RTW")
-    extracted.update(rtw_fields)
+    extracted.update(extract_rtw_fields(session_folder / "RTW"))
 
     for field, priority_folders in FIELD_PRIORITY.items():
-        if field in ["Role", "Training Date", "Training Expiry Date", "Employment History Summary", "RTW Status", "Visa Start Date", "Visa Expiry Date", "Visa Type", "Restriction"]:
+        if field in ["Role", "Training Date", "Training Expiry Date", "Employment History Summary", "RTW Status", "RTW Check Date", "Visa Start Date", "Visa Expiry Date", "Visa Type", "Restriction"]:
             continue
         if field == "NMC PIN":
-            if role == "RGN" and folder_paths.get("NMC"):
-                prompt = """Extract the NMC PIN from the attached NMC document. Return JSON only as {\"NMC PIN\": \"\"}. If not clearly visible, return an empty string."""
-                data = _run_gemini_json_prompt(prompt, folder_paths.get("NMC") or [])
-                value = _normalize_spaces(str(data.get("NMC PIN", "")))
-                if value:
-                    extracted["NMC PIN"] = FieldValue(value, f"NMC/{folder_files.get('NMC', ['document'])[0]}", 0.85, True)
+            if role == "RGN" and folder_texts.get("NMC"):
+                ai_result = ai_extract_from_text(folder_texts["NMC"], ["NMC PIN"])
+                if "NMC PIN" in ai_result:
+                    extracted["NMC PIN"] = ai_result["NMC PIN"]
+                    if folder_files.get("NMC"):
+                        extracted["NMC PIN"].source = f"NMC/{folder_files.get('NMC')[0]}"
             else:
                 extracted["NMC PIN"] = FieldValue("NA", "Role is HCA", 1.0, False)
             continue
         for folder in priority_folders:
             if folder in ("AUTO", "CALCULATED"):
                 continue
-            paths = folder_paths.get(folder) or []
-            text_blob = folder_texts.get(folder) or ""
-            files = folder_files.get(folder) or ["document"]
-            if paths:
-                data = _run_gemini_json_prompt(
-                    f"""Extract the field {field!r} from the attached document(s). Return JSON only as {{\"{field}\": \"\"}}.
-- If the field is not clearly visible, return an empty string.
-- Use dd/mm/yy for dates.
-- Candidate Name must be the applicant's name, not employer/company.""",
-                    paths
-                )
-                value = _normalize_spaces(str(data.get(field, "")))
-                if value:
-                    extracted[field] = FieldValue(value, f"{folder}/{files[0]}", 0.85, True)
-                    break
-            if text_blob:
-                ai_result = ai_extract_from_text(text_blob, [field])
+            if folder_paths.get(folder):
+                ai_result = ai_extract_from_files(folder_paths[folder], [field])
                 if field in ai_result and _normalize_spaces(ai_result[field].value):
                     extracted[field] = ai_result[field]
-                    extracted[field].source = f"{folder}/{files[0]}"
+                    extracted[field].source = f"{folder}/{folder_files.get(folder, ['document'])[0]}"
+                    break
+                vision_result = ai_extract_from_vision_files(folder_paths[folder], [field])
+                if field in vision_result and _normalize_spaces(vision_result[field].value):
+                    extracted[field] = vision_result[field]
+                    extracted[field].source = f"{folder} (Gemini vision)"
+                    break
+            if folder_texts.get(folder):
+                ai_result = ai_extract_from_text(folder_texts[folder], [field])
+                if field in ai_result and _normalize_spaces(ai_result[field].value):
+                    extracted[field] = ai_result[field]
+                    extracted[field].source = f"{folder}/{folder_files.get(folder, ['document'])[0]}"
                     break
 
     if not (extracted.get("DBS Issue Date") and extracted["DBS Issue Date"].value.strip()):
         issue = extract_print_date_from_text(folder_texts.get("DBS", ""))
         if issue:
-            extracted["DBS Issue Date"] = FieldValue(normalize_date_value(issue), "DBS (Print Date used as Issue Date)", 0.80, True)
+            extracted["DBS Issue Date"] = FieldValue(issue, "DBS (Print Date used as Issue Date)", 0.80, True)
 
     extracted = apply_post_processing(extracted)
     extracted = apply_business_overrides(extracted, session_folder)
@@ -1618,53 +1660,6 @@ def _start_bg_worker():
     _ensure_dispatcher_started()
 
 
-def _flatten_field_values(data: Dict[str, Any]) -> Dict[str, str]:
-    flattened: Dict[str, str] = {}
-    for field in STANDARD_FIELDS:
-        raw = (data or {}).get(field, "")
-        if isinstance(raw, dict):
-            flattened[field] = str(raw.get("value", "") or "")
-        else:
-            flattened[field] = str(raw or "")
-    return flattened
-
-
-def _export_csv_bytes(flat_values: Dict[str, str]) -> bytes:
-    output = io.StringIO()
-    writer = csv.writer(output)
-    writer.writerow(STANDARD_FIELDS)
-    writer.writerow([flat_values.get(field, "") for field in STANDARD_FIELDS])
-    return output.getvalue().encode("utf-8-sig")
-
-
-def _export_xlsx_bytes(flat_values: Dict[str, str]) -> bytes:
-    if Workbook is None:
-        raise RuntimeError("openpyxl is not installed")
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Details"
-    header_fill = PatternFill(fill_type="solid", fgColor="1F4E78") if PatternFill else None
-    header_font = Font(color="FFFFFF", bold=True) if Font else None
-    center = Alignment(vertical="center", wrap_text=True) if Alignment else None
-    for col, field in enumerate(STANDARD_FIELDS, start=1):
-        cell = ws.cell(row=1, column=col, value=field)
-        if header_fill:
-            cell.fill = header_fill
-        if header_font:
-            cell.font = header_font
-        if center:
-            cell.alignment = center
-        value_cell = ws.cell(row=2, column=col, value=flat_values.get(field, ""))
-        if center:
-            value_cell.alignment = center
-        ws.column_dimensions[cell.column_letter].width = max(16, min(28, len(field) + 4))
-    ws.freeze_panes = "A2"
-    bio = io.BytesIO()
-    wb.save(bio)
-    bio.seek(0)
-    return bio.getvalue()
-
-
 @app.route('/')
 def index():
     token = _get_ns_token(request)
@@ -1809,30 +1804,6 @@ def save_review(session_id):
     return jsonify({'success': True, 'session_id': session_id, 'status': 'review_ready', 'message': 'Reviewed data saved successfully.'})
 
 
-@app.route('/export/<session_id>/<fmt>', methods=['POST'])
-def export_review_data(session_id, fmt):
-    ctx = _require_auth()
-    import db
-    job = db.get_job_by_session(session_id, ctx['tenant_id'], ctx['user_id'])
-    if not job:
-        return jsonify({'success': False, 'error_message': 'Session not found'}), 404
-
-    payload = request.get_json(silent=True) or {}
-    field_values = payload.get('field_values') or payload.get('data') or {}
-    if field_values:
-        flat_values = _flatten_field_values(field_values)
-    else:
-        base_path = Path(job.get('reviewed_data_path') or job.get('extracted_data_path') or _extracted_json_path(ctx['tenant_id'], ctx['user_id'], session_id))
-        flat_values = _flatten_field_values(_read_json(base_path) or {})
-
-    candidate = secure_filename((flat_values.get('Candidate Name') or 'candidate').replace(' ', '_')) or 'candidate'
-    if fmt == 'csv':
-        return send_file(io.BytesIO(_export_csv_bytes(flat_values)), mimetype='text/csv', as_attachment=True, download_name=f'{candidate}_details.csv')
-    if fmt == 'xlsx':
-        return send_file(io.BytesIO(_export_xlsx_bytes(flat_values)), mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', as_attachment=True, download_name=f'{candidate}_details.xlsx')
-    return jsonify({'success': False, 'error_message': 'Unsupported export format'}), 400
-
-
 @app.route('/generate', methods=['POST'])
 @app.route('/process', methods=['POST'])
 def process_documents():
@@ -1898,11 +1869,11 @@ def process_documents():
             'Training Date': flat_field_values.get('Training Date', ''),
             'Training Expiry Date': flat_field_values.get('Training Expiry Date', ''),
             'RTW Status': flat_field_values.get('RTW Status', ''),
+            'RTW Check Date': flat_field_values.get('RTW Check Date', ''),
             'Visa Start Date': flat_field_values.get('Visa Start Date', ''),
             'Visa Expiry Date': flat_field_values.get('Visa Expiry Date', ''),
             'Visa Type': flat_field_values.get('Visa Type', ''),
             'Restriction': flat_field_values.get('Restriction', ''),
-            'Share Code': '',
             'Gender': flat_field_values.get('Gender', ''),
             'Employment History Summary': flat_field_values.get('Employment History Summary', ''),
             "Today's Date": todays,
@@ -1960,6 +1931,55 @@ def process_documents():
             pass
         return jsonify({'success': False, 'error_message': str(e), 'status': 'generation_failed'}), 500
 
+
+
+
+def _load_final_field_values(session_id: str, tenant_id: Any, user_id: Any) -> Dict[str, str]:
+    reviewed = _read_json(_reviewed_json_path(tenant_id, user_id, session_id)) or {}
+    if reviewed:
+        return {k: (v.get('value', '') if isinstance(v, dict) else v) for k, v in reviewed.items()}
+    extracted = _read_json(_extracted_json_path(tenant_id, user_id, session_id)) or {}
+    return {k: (v.get('value', '') if isinstance(v, dict) else v) for k, v in extracted.items()}
+
+def _ordered_export_fields(values: Dict[str, str]) -> List[str]:
+    fields = list(STANDARD_FIELDS)
+    if 'RTW Check Date' not in fields:
+        fields.insert(fields.index('RTW Status') + 1, 'RTW Check Date')
+    for k in values.keys():
+        if k not in fields:
+            fields.append(k)
+    return fields
+
+@app.route('/export/<session_id>.csv')
+def export_csv(session_id):
+    ctx = _require_auth()
+    values = _load_final_field_values(session_id, ctx['tenant_id'], ctx['user_id'])
+    fields = _ordered_export_fields(values)
+    si = StringIO()
+    writer = csv.writer(si)
+    writer.writerow(fields)
+    writer.writerow([values.get(f, '') or '' for f in fields])
+    data = BytesIO(si.getvalue().encode('utf-8-sig'))
+    data.seek(0)
+    return send_file(data, as_attachment=True, download_name='details.csv', mimetype='text/csv')
+
+@app.route('/export/<session_id>.xlsx')
+def export_xlsx(session_id):
+    ctx = _require_auth()
+    if Workbook is None:
+        return jsonify({'success': False, 'error_message': 'Excel export is unavailable.'}), 500
+    values = _load_final_field_values(session_id, ctx['tenant_id'], ctx['user_id'])
+    fields = _ordered_export_fields(values)
+    wb = Workbook()
+    ws = wb.active
+    ws.title = 'Details'
+    for idx, field in enumerate(fields, start=1):
+        ws.cell(row=1, column=idx, value=field)
+        ws.cell(row=2, column=idx, value=values.get(field, '') or '')
+    bio = BytesIO()
+    wb.save(bio)
+    bio.seek(0)
+    return send_file(bio, as_attachment=True, download_name='details.xlsx', mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
 
 @app.route('/outputs/<session_id>', methods=['GET'])
 def outputs_api(session_id):
@@ -2043,7 +2063,7 @@ def download_zip(session_id):
 
 @app.route('/health')
 def health_check():
-    return jsonify({'status': 'healthy', 'gemini_configured': bool(gemini_client), 'pymupdf_available': bool(fitz), 'model_fast': GEMINI_MODEL_FAST, 'model_strong': GEMINI_MODEL_STRONG, 'db': bool(os.getenv('DATABASE_URL')), 'checklist_global_concurrency': CHECKLIST_GLOBAL_CONCURRENCY})
+    return jsonify({'status': 'healthy', 'gemini_configured': bool(gemini_client), 'tesseract_available': False, 'pdfplumber_available': bool(pdfplumber), 'pymupdf_available': bool(fitz), 'model_fast': GEMINI_MODEL_FAST, 'model_strong': GEMINI_MODEL_STRONG, 'db': bool(os.getenv('DATABASE_URL')), 'checklist_global_concurrency': CHECKLIST_GLOBAL_CONCURRENCY})
 
 
 if __name__ == '__main__':
