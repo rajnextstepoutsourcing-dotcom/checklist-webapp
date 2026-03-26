@@ -187,6 +187,10 @@
     <h2>Step 2 — Review &amp; edit extracted fields</h2>
     <p class="muted small" style="margin-bottom:12px;">Extracted values are shown below. Edit any field before generating. <strong>Form Completed By</strong>, <strong>Signature</strong>, and <strong>Position</strong> are manual fields and should be filled by the user.</p>
     <div class="fields-grid" id="fieldsGrid"></div>
+    <div class="row">
+      <button type="button" class="ghost" onclick="downloadDetails('csv')">⬇ Download Details CSV</button>
+      <button type="button" class="ghost" onclick="downloadDetails('xlsx')">⬇ Download Details Excel</button>
+    </div>
   </section>
 
   <!-- Step 3 — Select templates & generate -->
@@ -433,6 +437,24 @@ function renderFields(data) {
     `;
     grid.appendChild(div);
   });
+}
+
+
+async function downloadDetails(ext) {
+  if (!sessionId) { flash('Please extract first.', 'error'); return; }
+  try {
+    const fieldValues = collectFieldValues();
+    await fetch(`/review/${sessionId}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ data: fieldValues })
+    });
+    const url = `/export/${sessionId}.${ext}`;
+    const filename = ext === 'csv' ? 'details.csv' : 'details.xlsx';
+    await backgroundDownload(url, filename);
+  } catch (e) {
+    flash(e.message || 'Export failed', 'error');
+  }
 }
 
 function collectFieldValues() {
